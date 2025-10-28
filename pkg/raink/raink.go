@@ -965,8 +965,8 @@ type rankedObjectResponse struct {
 }
 
 type ReasoningProsCons struct {
-	Pros string `json:"pros"` // Points that weighed in favor of this item
-	Cons string `json:"cons"` // Points that weighed against this item
+	Pros string `json:"pros"` // Qualities that make this item MORE relevant to the ranking criteria
+	Cons string `json:"cons"` // Qualities that make this item LESS relevant to the ranking criteria
 }
 
 type RankedObject struct {
@@ -4571,8 +4571,8 @@ func (r *Ranker) summarizeReasoning(itemID string, itemValue string, snippets []
 	prompt := fmt.Sprintf(`Below are %d reasoning snippets from different comparisons of the item "%s". These snippets come from various rounds where this item was compared against different sets of items.
 
 Your task: Analyze these snippets and extract two things:
-1. PROS: Points that generally weighed in favor of this item (2-4 sentences)
-2. CONS: Points that generally weighed against this item (2-4 sentences)
+1. PROS: Qualities of this item that make it MORE RELEVANT to the user's ranking criteria/prompt. These are the positive aspects that support ranking this item higher. (2-4 sentences)
+2. CONS: Qualities of this item that make it LESS RELEVANT to the user's ranking criteria/prompt. These are the negative aspects or limitations that weigh against ranking this item higher. (2-4 sentences)
 
 Either pros or cons can be empty if there's nothing to say. For top-performing items, cons might be empty. For lower-performing items, pros might be minimal.
 
