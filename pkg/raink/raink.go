@@ -961,7 +961,7 @@ type rankedObject struct {
 
 type rankedObjectResponse struct {
 	Objects   []string          `json:"objects" jsonschema_description:"List of ranked object IDs"`
-	Reasoning map[string]string `json:"reasoning,omitempty" jsonschema_description:"Brief reasoning for each object's position"`
+	Reasoning map[string]string `json:"reasoning,omitempty" jsonschema_description:"Brief explanation of qualities that make each object more or less relevant to the ranking criteria"`
 }
 
 type ReasoningProsCons struct {
@@ -977,7 +977,7 @@ type RankedObject struct {
 	Exposure  int                 `json:"exposure"`
 	Rank      int                 `json:"rank"`
 	LastRound int                 `json:"last_round"` // 1-based: 1=threshing, 2+=ranking rounds
-	Reasoning *ReasoningProsCons  `json:"reasoning,omitempty"`  // Pros and cons from comparisons
+	Reasoning *ReasoningProsCons  `json:"reasoning,omitempty"`  // Pros and cons: qualities affecting item's relevance to ranking criteria
 }
 
 func generateSchema[T any]() interface{} {
@@ -4283,7 +4283,7 @@ func (r *Ranker) rankObjects(group []object, runNumber int, batchNumber int) ([]
 		// Add reasoning request if enabled and not in threshing round
 		if r.cfg.Reasoning && r.round > 1 {
 			r.cfg.Logger.Debug("Adding reasoning request to prompt", "round", r.round, "batch", batchNumber)
-			prompt += "\n\nIMPORTANT: In addition to ranking, you must also provide reasoning. For each item, write a brief 1-2 sentence explanation of why it ranked in that position relative to the others in this batch. Focus on distinctive features that made it rank higher or lower.\n\n"
+			prompt += "\n\nIMPORTANT: In addition to ranking, you must also provide reasoning. For each item, write a brief 1-2 sentence explanation focusing on the specific qualities that make it MORE or LESS relevant to the ranking criteria/prompt. Do not confuse 'good qualities' with 'relevant to prompt' - for example, if ranking by 'find vulnerabilities', vulnerabilities are relevant even though they are bad.\n\n"
 			prompt += "Your response must include both:\n"
 			prompt += "1. An 'objects' array with the ranked IDs\n"
 			prompt += "2. A 'reasoning' object mapping each ID to its explanation\n\n"
@@ -4571,8 +4571,10 @@ func (r *Ranker) summarizeReasoning(itemID string, itemValue string, snippets []
 	prompt := fmt.Sprintf(`Below are %d reasoning snippets from different comparisons of the item "%s". These snippets come from various rounds where this item was compared against different sets of items.
 
 Your task: Analyze these snippets and extract two things:
-1. PROS: Qualities of this item that make it MORE RELEVANT to the user's ranking criteria/prompt. These are the positive aspects that support ranking this item higher. (2-4 sentences)
-2. CONS: Qualities of this item that make it LESS RELEVANT to the user's ranking criteria/prompt. These are the negative aspects or limitations that weigh against ranking this item higher. (2-4 sentences)
+1. PROS: Qualities of this item that make it RELEVANT to the user's ranking criteria/prompt. Focus strictly on relevance, not whether these qualities are inherently "good" or "bad". (2-4 sentences)
+2. CONS: Qualities of this item that make it NOT RELEVANT to the user's ranking criteria/prompt. Focus strictly on lack of relevance, not whether these qualities are inherently "good" or "bad". (2-4 sentences)
+
+CRITICAL: Do not confuse "positive/negative qualities" with "relevant/not relevant". For example, if the prompt asks to "find security vulnerabilities", then vulnerabilities are RELEVANT (pros) even though they are bad, and secure code practices are NOT RELEVANT (cons) even though they are good.
 
 Either pros or cons can be empty if there's nothing to say. For top-performing items, cons might be empty. For lower-performing items, pros might be minimal.
 
