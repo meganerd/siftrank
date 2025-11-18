@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -656,7 +657,7 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 				r.semaphore <- struct{}{}
 
 				// Process batch
-				rankedBatch, err := r.rankDocs(work.batch, work.trialNum, work.batchNum)
+				rankedBatch, err := r.rankDocs(ctx, work.batch, work.trialNum, work.batchNum)
 
 				// Release semaphore
 				<-r.semaphore
@@ -684,6 +685,10 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 	// Collect results
 	for result := range resultsChan {
 		if result.err != nil {
+			// Skip logging if context was cancelled (intentional due to convergence)
+			if errors.Is(result.err, context.Canceled) {
+				continue
+			}
 			r.cfg.Logger.Error("Error in batch processing", "error", result.err)
 			continue
 		}
@@ -806,12 +811,13 @@ func findElbow(rankedDocs []RankedDocument) int {
 }
 
 // isElbowStable checks if recent elbow positions are within tolerance
-func (r *Ranker) isElbowStable(numDocuments int) bool {
+// Returns (isStable, actualTolerance)
+func (r *Ranker) isElbowStable(numDocuments int) (bool, int) {
 	n := len(r.elbowPositions)
 
 	// Need at least StableTrials to check
 	if n < r.cfg.StableTrials {
-		return false
+		return false, 0
 	}
 
 	// Get the most recent positions
@@ -836,7 +842,8 @@ func (r *Ranker) isElbowStable(numDocuments int) bool {
 	}
 
 	// Check if range is within tolerance
-	return (maxPos - minPos) <= tolerance
+	isStable := (maxPos - minPos) <= tolerance
+	return isStable, tolerance
 }
 
 // hasConverged checks if the ranking has stabilized across trials
@@ -903,7 +910,7 @@ func (r *Ranker) hasConverged(scores map[string][]float64, exposureCounts map[st
 		"total_docs", len(currentRankings))
 
 	// Check if elbow has stabilized
-	stable := r.isElbowStable(len(currentRankings))
+	stable, actualTolerance := r.isElbowStable(len(currentRankings))
 
 	if stable {
 		// Acquire lock to set convergence flag
@@ -913,9 +920,9 @@ func (r *Ranker) hasConverged(scores map[string][]float64, exposureCounts map[st
 			r.converged = true
 			r.cfg.Logger.Info("Elbow position stabilized",
 				"round", r.round,
-				"trial", completedTrialNum,
+				"trials_completed", len(r.elbowPositions),
 				"recent_positions", r.elbowPositions[len(r.elbowPositions)-r.cfg.StableTrials:],
-				"tolerance", int(r.cfg.ElbowTolerance*float64(len(currentRankings))))
+				"tolerance", actualTolerance)
 		}
 		r.mu.Unlock()
 	}
@@ -1017,7 +1024,7 @@ func (r *Ranker) estimateTokens(group []document, includePrompt bool) int {
 	return len(r.encoding.Encode(text, nil, nil))
 }
 
-func (r *Ranker) rankDocs(group []document, trialNumber int, batchNumber int) ([]rankedDocument, error) {
+func (r *Ranker) rankDocs(ctx context.Context, group []document, trialNumber int, batchNumber int) ([]rankedDocument, error) {
 	if r.cfg.DryRun {
 		r.cfg.Logger.Debug("Dry run API call")
 		// Simulate a ranked response for dry run
@@ -1033,6 +1040,11 @@ func (r *Ranker) rankDocs(group []document, trialNumber int, batchNumber int) ([
 
 	maxRetries := 10
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Check if context cancelled
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
 		// Try to create memorable ID mappings for each attempt
 		originalToTemp, tempToOriginal, err := createIDMappings(group, r.rng, r.cfg.Logger)
 		useMemorableIDs := err == nil && originalToTemp != nil && tempToOriginal != nil
@@ -1056,7 +1068,7 @@ func (r *Ranker) rankDocs(group []document, trialNumber int, batchNumber int) ([
 		}
 
 		var rankedResponse rankedDocumentResponse
-		rankedResponse, err = r.callOpenAI(prompt, trialNumber, batchNumber, inputIDs)
+		rankedResponse, err = r.callOpenAI(ctx, prompt, trialNumber, batchNumber, inputIDs)
 		if err != nil {
 			if attempt == maxRetries-1 {
 				return nil, err
@@ -1174,7 +1186,7 @@ func validateIDs(rankedResponse *rankedDocumentResponse, inputIDs map[string]boo
 	}
 }
 
-func (r *Ranker) callOpenAI(prompt string, trialNum int, batchNum int, inputIDs map[string]bool) (rankedDocumentResponse, error) {
+func (r *Ranker) callOpenAI(ctx context.Context, prompt string, trialNum int, batchNum int, inputIDs map[string]bool) (rankedDocumentResponse, error) {
 
 	customTransport := &customTransport{Transport: http.DefaultTransport}
 	customClient := &http.Client{Transport: customTransport}
@@ -1205,10 +1217,16 @@ func (r *Ranker) callOpenAI(prompt string, trialNum int, batchNum int, inputIDs 
 
 	var rankedResponse rankedDocumentResponse
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		// Check if context cancelled before API call
+		if ctx.Err() != nil {
+			return rankedDocumentResponse{}, ctx.Err()
+		}
+
+		// Create timeout context that respects parent cancellation
+		timeoutCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		defer cancel()
 
-		completion, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+		completion, err := client.Chat.Completions.New(timeoutCtx, openai.ChatCompletionNewParams{
 			Messages: conversationHistory,
 			ResponseFormat: openai.ChatCompletionNewParamsResponseFormatUnion{
 				OfJSONSchema: &shared.ResponseFormatJSONSchemaParam{
@@ -1251,6 +1269,11 @@ func (r *Ranker) callOpenAI(prompt string, trialNum int, batchNum int, inputIDs 
 			}
 
 			return rankedResponse, nil
+		}
+
+		// Check if cancellation caused the error
+		if ctx.Err() != nil {
+			return rankedDocumentResponse{}, ctx.Err()
 		}
 
 		if err == context.DeadlineExceeded {
