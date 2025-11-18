@@ -237,6 +237,7 @@ type RankedDocument struct {
 	Score    float64     `json:"score"`
 	Exposure int         `json:"exposure"`
 	Rank     int         `json:"rank"`
+	Rounds   int         `json:"rounds"` // number of rounds participated in
 }
 
 func generateSchema[T any]() interface{} {
@@ -449,6 +450,7 @@ func (r *Ranker) rank(documents []document, round int) []RankedDocument {
 				Document: documents[0].Document,
 				Score:    0, // 0 is guaranteed to be the "highest" score.
 				Exposure: 1,
+				Rounds:   round,
 			},
 		}
 	}
@@ -738,6 +740,7 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 					Document: doc.Document,
 					Score:    score,
 					Exposure: exposureCounts[id],
+					Rounds:   r.round,
 				})
 				break
 			}
