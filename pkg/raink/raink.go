@@ -139,7 +139,8 @@ type Ranker struct {
 	round          int
 	semaphore      chan struct{} // Global concurrency limiter
 	elbowPositions []int         // Track elbow position after each trial
-	mu             sync.Mutex    // Protect elbowPositions and converged
+	rankingOrders  [][]string    // Track full ranking order per trial
+	mu             sync.Mutex    // Protect elbowPositions, rankingOrders, and converged
 	converged      bool          // Track if convergence already detected
 	elbowCutoff    int           // Cutoff position for refinement
 }
@@ -543,6 +544,7 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 	r.mu.Lock()
 	r.converged = false
 	r.elbowPositions = nil // Also clear elbow history
+	r.rankingOrders = nil  // Clear ranking order history
 	r.elbowCutoff = -1     // Reset cutoff
 	r.mu.Unlock()
 
@@ -846,6 +848,35 @@ func (r *Ranker) isElbowStable(numDocuments int) (bool, int) {
 	return isStable, tolerance
 }
 
+// isRankingStable checks if the full ranking order has stabilized
+// Returns (isStable, actualTrialsChecked)
+func (r *Ranker) isRankingStable() (bool, int) {
+	n := len(r.rankingOrders)
+
+	// Need at least StableTrials to check
+	if n < r.cfg.StableTrials {
+		return false, 0
+	}
+
+	// Get the most recent ranking orders
+	recentOrders := r.rankingOrders[n-r.cfg.StableTrials:]
+
+	// Check if all recent orders are identical
+	firstOrder := recentOrders[0]
+	for i := 1; i < len(recentOrders); i++ {
+		if len(recentOrders[i]) != len(firstOrder) {
+			return false, len(recentOrders)
+		}
+		for j := range recentOrders[i] {
+			if recentOrders[i][j] != firstOrder[j] {
+				return false, len(recentOrders)
+			}
+		}
+	}
+
+	return true, len(recentOrders)
+}
+
 // hasConverged checks if the ranking has stabilized across trials
 // Returns true if early stopping should occur
 func (r *Ranker) hasConverged(scores map[string][]float64, exposureCounts map[string]int, completedTrialNum int) bool {
@@ -890,27 +921,49 @@ func (r *Ranker) hasConverged(scores map[string][]float64, exposureCounts map[st
 		return currentRankings[i].Score < currentRankings[j].Score
 	})
 
-	// Find elbow in current rankings
-	elbowPos := findElbow(currentRankings)
-
-	// If no elbow found, cannot converge
-	if elbowPos == -1 {
-		r.cfg.Logger.Debug("No elbow found in trial", "trial", completedTrialNum)
-		return false
+	// Store the ranking order for this trial
+	rankingOrder := make([]string, len(currentRankings))
+	for i, doc := range currentRankings {
+		rankingOrder[i] = doc.Key
 	}
 
-	// Store elbow position for this trial
 	r.mu.Lock()
-	r.elbowPositions = append(r.elbowPositions, elbowPos)
+	r.rankingOrders = append(r.rankingOrders, rankingOrder)
 	r.mu.Unlock()
 
-	r.cfg.Logger.Debug("Elbow detected",
-		"trial", completedTrialNum,
-		"position", elbowPos,
-		"total_docs", len(currentRankings))
+	// Check criterion 1: Elbow stabilization
+	var elbowStable bool
+	var actualTolerance int
 
-	// Check if elbow has stabilized
-	stable, actualTolerance := r.isElbowStable(len(currentRankings))
+	elbowPos := findElbow(currentRankings)
+	if elbowPos != -1 {
+		// Store elbow position
+		r.mu.Lock()
+		r.elbowPositions = append(r.elbowPositions, elbowPos)
+		r.mu.Unlock()
+
+		r.cfg.Logger.Debug("Elbow detected",
+			"trial", completedTrialNum,
+			"position", elbowPos,
+			"total_docs", len(currentRankings))
+
+		elbowStable, actualTolerance = r.isElbowStable(len(currentRankings))
+	} else {
+		r.cfg.Logger.Debug("No elbow found in trial", "trial", completedTrialNum)
+	}
+
+	// Check criterion 2: Ranking order stabilization
+	rankingStable, trialsChecked := r.isRankingStable()
+
+	if rankingStable {
+		r.cfg.Logger.Debug("Ranking order stable",
+			"trial", completedTrialNum,
+			"trials_checked", trialsChecked,
+			"total_docs", len(currentRankings))
+	}
+
+	// Converge if EITHER criterion is met
+	stable := elbowStable || rankingStable
 
 	if stable {
 		// Acquire lock to set convergence flag
@@ -918,11 +971,31 @@ func (r *Ranker) hasConverged(scores map[string][]float64, exposureCounts map[st
 		// Double-check we haven't converged in the meantime (race condition)
 		if !r.converged {
 			r.converged = true
-			r.cfg.Logger.Info("Elbow position stabilized",
-				"round", r.round,
-				"trials_completed", len(r.elbowPositions),
-				"recent_positions", r.elbowPositions[len(r.elbowPositions)-r.cfg.StableTrials:],
-				"tolerance", actualTolerance)
+
+			// Use len(r.rankingOrders) for all convergence types
+			// This shows how many trials were evaluated for convergence
+			trialsEvaluated := len(r.rankingOrders)
+
+			// Log which criterion triggered
+			if elbowStable && rankingStable {
+				r.cfg.Logger.Info("Convergence: elbow and ranking both stabilized",
+					"round", r.round,
+					"trials_evaluated", trialsEvaluated,
+					"recent_elbow_positions", r.elbowPositions[len(r.elbowPositions)-r.cfg.StableTrials:],
+					"elbow_tolerance", actualTolerance)
+			} else if elbowStable {
+				r.cfg.Logger.Info("Convergence: elbow position stabilized",
+					"round", r.round,
+					"trials_evaluated", trialsEvaluated,
+					"recent_positions", r.elbowPositions[len(r.elbowPositions)-r.cfg.StableTrials:],
+					"tolerance", actualTolerance)
+			} else {
+				r.cfg.Logger.Info("Convergence: ranking order stabilized",
+					"round", r.round,
+					"trials_evaluated", trialsEvaluated,
+					"trials_checked", trialsChecked,
+					"total_docs", len(currentRankings))
+			}
 		}
 		r.mu.Unlock()
 	}
@@ -936,19 +1009,35 @@ func (r *Ranker) setElbowCutoff(numDocuments int) {
 	defer r.mu.Unlock()
 
 	if !r.cfg.EnableConvergence {
-		// Convergence disabled - will use ratio-based approach in rank()
+		// Convergence disabled - cutoff won't be used
 		r.elbowCutoff = -1
 		return
 	}
 
-	if len(r.elbowPositions) == 0 {
-		// No elbow positions tracked (shouldn't happen, but be defensive)
+	// Check if we converged via ranking stability only (no valid elbows found)
+	hasValidElbow := false
+	for _, pos := range r.elbowPositions {
+		if pos > 0 {
+			hasValidElbow = true
+			break
+		}
+	}
+
+	if !hasValidElbow {
+		// Either no elbows tracked OR all were -1
+		// This means we converged via ranking stability (or didn't converge)
+		// Don't refine - the ranking is stable as-is
 		r.elbowCutoff = -1
+		if r.converged {
+			r.cfg.Logger.Debug("Ranking stabilized without elbow, skipping refinement",
+				"round", r.round,
+				"total_docs", numDocuments)
+		}
 		return
 	}
 
 	if r.converged {
-		// Convergence detected - use the last recorded elbow position
+		// Converged via elbow stability - use the last recorded elbow position
 		r.elbowCutoff = r.elbowPositions[len(r.elbowPositions)-1]
 		r.cfg.Logger.Debug("Using converged elbow position for refinement",
 			"round", r.round,
