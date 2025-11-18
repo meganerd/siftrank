@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
@@ -85,6 +86,12 @@ type Config struct {
 	DryRun          bool             `json:"-"`
 	Logger          *slog.Logger     `json:"-"`
 	LogLevel        slog.Level       `json:"-"` // Defaults to 0 (slog.LevelInfo)
+
+	// Convergence detection
+	EnableConvergence bool    `json:"enable_convergence"`
+	ElbowTolerance    float64 `json:"elbow_tolerance"`
+	StableTrials      int     `json:"stable_trials"`
+	MinTrials         int     `json:"min_trials"`
 }
 
 func (c *Config) Validate() error {
@@ -109,16 +116,30 @@ func (c *Config) Validate() error {
 	if c.BatchSize < minBatchSize {
 		return fmt.Errorf("batch size must be at least %d", minBatchSize)
 	}
+	if c.EnableConvergence {
+		if c.ElbowTolerance < 0 || c.ElbowTolerance >= 1 {
+			return fmt.Errorf("elbow tolerance must be >= 0 and < 1")
+		}
+		if c.StableTrials < 2 {
+			return fmt.Errorf("stable trials must be at least 2")
+		}
+		if c.MinTrials < 2 {
+			return fmt.Errorf("minimum trials must be at least 2")
+		}
+	}
 	return nil
 }
 
 type Ranker struct {
-	cfg        *Config
-	encoding   *tiktoken.Tiktoken
-	rng        *rand.Rand
-	numBatches int
-	round      int
-	semaphore  chan struct{} // Global concurrency limiter
+	cfg            *Config
+	encoding       *tiktoken.Tiktoken
+	rng            *rand.Rand
+	numBatches     int
+	round          int
+	semaphore      chan struct{} // Global concurrency limiter
+	elbowPositions []int         // Track elbow position after each trial
+	mu             sync.Mutex    // Protect elbowPositions and converged
+	converged      bool          // Track if convergence already detected
 }
 
 func NewRanker(config *Config) (*Ranker, error) {
@@ -494,6 +515,12 @@ func (r *Ranker) logFromApiCall(trialNum, batchNum int, message string, args ...
 }
 
 func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
+	// Reset convergence state for this recursion level (round)
+	r.mu.Lock()
+	r.converged = false
+	r.elbowPositions = nil // Also clear elbow history
+	r.mu.Unlock()
+
 	scores := make(map[string][]float64)
 	exposureCounts := make(map[string]int)
 	var scoresMutex sync.Mutex
@@ -650,13 +677,12 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 
 		// Check if this trial just completed
 		if completedBatches[result.trialNumber] == r.numBatches {
-			r.cfg.Logger.Info("Trial completed", "trial", result.trialNumber)
+			r.cfg.Logger.Info("Trial completed", "round", r.round, "trial", result.trialNumber)
 
 			// Check for convergence
 			if r.hasConverged(scores, exposureCounts, result.trialNumber) {
-				r.cfg.Logger.Info("Convergence detected, stopping early", "trial", result.trialNumber)
+				// No need to log here - hasConverged() already logged if it's the first detection
 				cancel() // Signal all workers to stop processing new work
-				// break    // Stop collecting results
 			}
 		}
 	}
@@ -694,18 +720,180 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 	return results
 }
 
+// perpendicularDistance calculates perpendicular distance from point to line
+func perpendicularDistance(x0, y0, x1, y1, x2, y2 float64) float64 {
+	// Line from (x1, y1) to (x2, y2)
+	// Point at (x0, y0)
+	// Formula: |ax + by + c| / sqrt(a^2 + b^2)
+	// where line is ax + by + c = 0
+
+	numerator := math.Abs((y2-y1)*x0 - (x2-x1)*y0 + x2*y1 - y2*x1)
+	denominator := math.Sqrt((y2-y1)*(y2-y1) + (x2-x1)*(x2-x1))
+
+	if denominator == 0 {
+		return 0
+	}
+
+	return numerator / denominator
+}
+
+// findElbow returns the index of the elbow in a sorted list of ranked documents
+// Returns -1 if elbow cannot be determined (e.g., too few documents)
+func findElbow(rankedDocs []RankedDocument) int {
+	n := len(rankedDocs)
+
+	// Need at least 3 documents to find an elbow
+	if n < 3 {
+		return -1
+	}
+
+	firstScore := rankedDocs[0].Score
+	lastScore := rankedDocs[n-1].Score
+
+	// If scores are identical (flat line), no elbow exists
+	if firstScore == lastScore {
+		return -1
+	}
+
+	maxDist := 0.0
+	elbowIdx := -1
+
+	// Check each document except first and last
+	for i := 1; i < n-1; i++ {
+		dist := perpendicularDistance(
+			float64(i),
+			rankedDocs[i].Score,
+			0.0,
+			firstScore,
+			float64(n-1),
+			lastScore,
+		)
+
+		if dist > maxDist {
+			maxDist = dist
+			elbowIdx = i
+		}
+	}
+
+	return elbowIdx
+}
+
+// isElbowStable checks if recent elbow positions are within tolerance
+func (r *Ranker) isElbowStable(numDocuments int) bool {
+	n := len(r.elbowPositions)
+
+	// Need at least StableTrials to check
+	if n < r.cfg.StableTrials {
+		return false
+	}
+
+	// Get the most recent positions
+	recentPositions := r.elbowPositions[n-r.cfg.StableTrials:]
+
+	// Calculate tolerance in absolute terms (number of positions)
+	tolerance := int(r.cfg.ElbowTolerance * float64(numDocuments))
+	if tolerance < 1 {
+		tolerance = 1 // At minimum, allow 1 position variance
+	}
+
+	// Find min and max of recent positions
+	minPos := recentPositions[0]
+	maxPos := recentPositions[0]
+	for _, pos := range recentPositions[1:] {
+		if pos < minPos {
+			minPos = pos
+		}
+		if pos > maxPos {
+			maxPos = pos
+		}
+	}
+
+	// Check if range is within tolerance
+	return (maxPos - minPos) <= tolerance
+}
+
 // hasConverged checks if the ranking has stabilized across trials
 // Returns true if early stopping should occur
 func (r *Ranker) hasConverged(scores map[string][]float64, exposureCounts map[string]int, completedTrialNum int) bool {
-	// FUTURE: Implement convergence detection
-	// Could check:
-	// - Standard deviation of scores for each item
-	// - Rank position stability across recent trials
-	// - Score differences between consecutive trials
-	// - Minimum number of trials completed before allowing convergence
+	// Early stopping disabled
+	if !r.cfg.EnableConvergence {
+		return false
+	}
 
-	// For now, never converge early
-	return false
+	// Check if we already detected convergence (quick exit)
+	r.mu.Lock()
+	alreadyConverged := r.converged
+	r.mu.Unlock()
+
+	if alreadyConverged {
+		// Convergence already detected by another trial
+		// Still return true to respect the cancellation, but don't log again
+		return true
+	}
+
+	// Not enough trials yet
+	if completedTrialNum < r.cfg.MinTrials {
+		return false
+	}
+
+	// Calculate current rankings based on scores so far
+	var currentRankings []RankedDocument
+	for id, scoreList := range scores {
+		var sum float64
+		for _, score := range scoreList {
+			sum += score
+		}
+		avgScore := sum / float64(len(scoreList))
+
+		currentRankings = append(currentRankings, RankedDocument{
+			Key:   id,
+			Score: avgScore,
+		})
+	}
+
+	// Sort by score (lower is better)
+	sort.Slice(currentRankings, func(i, j int) bool {
+		return currentRankings[i].Score < currentRankings[j].Score
+	})
+
+	// Find elbow in current rankings
+	elbowPos := findElbow(currentRankings)
+
+	// If no elbow found, cannot converge
+	if elbowPos == -1 {
+		r.cfg.Logger.Debug("No elbow found in trial", "trial", completedTrialNum)
+		return false
+	}
+
+	// Store elbow position for this trial
+	r.mu.Lock()
+	r.elbowPositions = append(r.elbowPositions, elbowPos)
+	r.mu.Unlock()
+
+	r.cfg.Logger.Debug("Elbow detected",
+		"trial", completedTrialNum,
+		"position", elbowPos,
+		"total_docs", len(currentRankings))
+
+	// Check if elbow has stabilized
+	stable := r.isElbowStable(len(currentRankings))
+
+	if stable {
+		// Acquire lock to set convergence flag
+		r.mu.Lock()
+		// Double-check we haven't converged in the meantime (race condition)
+		if !r.converged {
+			r.converged = true
+			r.cfg.Logger.Info("Elbow position stabilized",
+				"round", r.round,
+				"trial", completedTrialNum,
+				"recent_positions", r.elbowPositions[len(r.elbowPositions)-r.cfg.StableTrials:],
+				"tolerance", int(r.cfg.ElbowTolerance*float64(len(currentRankings))))
+		}
+		r.mu.Unlock()
+	}
+
+	return stable
 }
 
 func (r *Ranker) logTokenSizes(group []document) {

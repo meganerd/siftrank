@@ -30,6 +30,12 @@ func main() {
 	dryRun := flag.Bool("dry-run", false, "Enable dry run mode (log API calls without making them)")
 	refinementRatio := flag.Float64("ratio", 0.1, "Refinement ratio as a decimal (e.g., 0.5 for 50%)")
 	debug := flag.Bool("debug", false, "Enable debug logging")
+
+	noConverge := flag.Bool("no-converge", false, "Disable early stopping based on convergence")
+	elbowTolerance := flag.Float64("elbow-tolerance", 0.05, "Elbow position tolerance (0.05 = 5%)")
+	stableTrials := flag.Int("stable-trials", 5, "Stable trials required for convergence")
+	minTrials := flag.Int("min-trials", 3, "Minimum trials before checking convergence")
+
 	flag.Parse()
 
 	// Set up structured logging with level based on debug flag
@@ -81,6 +87,11 @@ func main() {
 		BatchTokens:     *batchTokens,
 		DryRun:          *dryRun,
 		LogLevel:        logLevel,
+
+		EnableConvergence: !*noConverge,
+		ElbowTolerance:    *elbowTolerance,
+		StableTrials:      *stableTrials,
+		MinTrials:         *minTrials,
 	}
 
 	ranker, err := raink.NewRanker(config)
