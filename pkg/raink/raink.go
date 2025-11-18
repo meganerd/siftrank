@@ -148,7 +148,7 @@ func NewRanker(config *Config) (*Ranker, error) {
 }
 
 // dynamically adjust batch size to fit within token limits
-func (ranker *Ranker) adjustBatchSize(objects []object, samples int) error {
+func (ranker *Ranker) adjustBatchSize(documents []document, samples int) error {
 	// Dynamically adjust batch size upfront.
 	for {
 		valid := true
@@ -156,12 +156,12 @@ func (ranker *Ranker) adjustBatchSize(objects []object, samples int) error {
 		var numBatches int
 
 		for i := 0; i < samples; i++ {
-			ranker.rng.Shuffle(len(objects), func(i, j int) {
-				objects[i], objects[j] = objects[j], objects[i]
+			ranker.rng.Shuffle(len(documents), func(i, j int) {
+				documents[i], documents[j] = documents[j], documents[i]
 			})
-			numBatches = max(1, len(objects)/ranker.cfg.BatchSize) // Need at least one batch.
+			numBatches = max(1, len(documents)/ranker.cfg.BatchSize) // Need at least one batch.
 			for j := 0; j < numBatches; j++ {
-				batch := objects[j*ranker.cfg.BatchSize : (j+1)*min(len(objects), ranker.cfg.BatchSize)] // Don't index more objects than we have.
+				batch := documents[j*ranker.cfg.BatchSize : (j+1)*min(len(documents), ranker.cfg.BatchSize)] // Don't index more documents than we have.
 				estBatchTokens := ranker.estimateTokens(batch, true)
 				estTotalTokens += estBatchTokens
 				if estBatchTokens > ranker.cfg.TokenLimit {
@@ -191,25 +191,25 @@ func (ranker *Ranker) adjustBatchSize(objects []object, samples int) error {
 	return nil
 }
 
-type object struct {
-	ID     string      `json:"id"`
-	Value  string      `json:"value"`  // to be ranked
-	Object interface{} `json:"object"` // if loading from json file
+type document struct {
+	ID       string      `json:"id"`
+	Value    string      `json:"value"`    // to be ranked
+	Document interface{} `json:"document"` // if loading from json file
 }
 
-type rankedObject struct {
-	Object object
-	Score  float64
+type rankedDocument struct {
+	Document document
+	Score    float64
 }
 
-type rankedObjectResponse struct {
-	Objects []string `json:"objects" jsonschema_description:"List of ranked object IDs"`
+type rankedDocumentResponse struct {
+	Documents []string `json:"docs" jsonschema_description:"List of ranked document IDs"`
 }
 
-type RankedObject struct {
+type RankedDocument struct {
 	Key      string      `json:"key"`
 	Value    string      `json:"value"`
-	Object   interface{} `json:"object"` // if loading from json file
+	Document interface{} `json:"document"` // if loading from json file
 	Score    float64     `json:"score"`
 	Exposure int         `json:"exposure"`
 	Rank     int         `json:"rank"`
@@ -225,15 +225,15 @@ func generateSchema[T any]() interface{} {
 	return schema
 }
 
-// createIDMappings generates memorable temporary IDs for a batch of objects
-func createIDMappings(objects []object, rng *rand.Rand, logger *slog.Logger) (map[string]string, map[string]string, error) {
+// createIDMappings generates memorable temporary IDs for a batch of documents
+func createIDMappings(documents []document, rng *rand.Rand, logger *slog.Logger) (map[string]string, map[string]string, error) {
 	originalToTemp := make(map[string]string)
 	tempToOriginal := make(map[string]string)
 	usedCombos := make(map[string]bool)
 
 	maxAttempts := len(adjectives) * len(nouns) * 2 // Allow some randomness
 
-	for _, obj := range objects {
+	for _, doc := range documents {
 		attempts := 0
 		found := false
 
@@ -254,8 +254,8 @@ func createIDMappings(objects []object, rng *rand.Rand, logger *slog.Logger) (ma
 			// If no repeats and not used, use this combination
 			if !hasRepeats && !usedCombos[combination] {
 				usedCombos[combination] = true
-				originalToTemp[obj.ID] = combination
-				tempToOriginal[combination] = obj.ID
+				originalToTemp[doc.ID] = combination
+				tempToOriginal[combination] = doc.ID
 				found = true
 			}
 
@@ -273,15 +273,15 @@ func createIDMappings(objects []object, rng *rand.Rand, logger *slog.Logger) (ma
 }
 
 // translateIDsInResponse translates temporary IDs back to original IDs in the response
-func translateIDsInResponse(response *rankedObjectResponse, tempToOriginal map[string]string) {
-	for i, id := range response.Objects {
+func translateIDsInResponse(response *rankedDocumentResponse, tempToOriginal map[string]string) {
+	for i, id := range response.Documents {
 		if originalID, exists := tempToOriginal[id]; exists {
-			response.Objects[i] = originalID
+			response.Documents[i] = originalID
 		}
 	}
 }
 
-var rankedObjectResponseSchema = generateSchema[rankedObjectResponse]()
+var rankedDocumentResponseSchema = generateSchema[rankedDocumentResponse]()
 
 // ShortDeterministicID generates a deterministic ID of specified length from input string.
 // It uses SHA-256 hash and Base64 encoding, keeping only alphanumeric characters.
@@ -302,26 +302,26 @@ func ShortDeterministicID(input string, length int) string {
 	return filtered[:length]
 }
 
-// ranks objects loaded from a file with optional template
-func (r *Ranker) RankFromFile(filePath string, templateData string, forceJSON bool) ([]RankedObject, error) {
-	objects, err := r.loadObjectsFromFile(filePath, templateData, forceJSON)
+// ranks documents loaded from a file with optional template
+func (r *Ranker) RankFromFile(filePath string, templateData string, forceJSON bool) ([]RankedDocument, error) {
+	documents, err := r.loadDocumentsFromFile(filePath, templateData, forceJSON)
 	if err != nil {
 		return nil, err
 	}
 
-	// check that no object is too large
-	for _, obj := range objects {
-		tokens := r.estimateTokens([]object{obj}, true)
+	// check that no document is too large
+	for _, doc := range documents {
+		tokens := r.estimateTokens([]document{doc}, true)
 		if tokens > r.cfg.BatchTokens {
-			return nil, fmt.Errorf("object is too large with %d tokens:\n%s", tokens, obj.Value)
+			return nil, fmt.Errorf("document is too large with %d tokens:\n%s", tokens, doc.Value)
 		}
 	}
 
-	if err := r.adjustBatchSize(objects, 10); err != nil {
+	if err := r.adjustBatchSize(documents, 10); err != nil {
 		return nil, err
 	}
 
-	results := r.rank(objects, 1)
+	results := r.rank(documents, 1)
 
 	// Add the rank key to each final result based on its position in the list
 	for i := range results {
@@ -331,7 +331,7 @@ func (r *Ranker) RankFromFile(filePath string, templateData string, forceJSON bo
 	return results, nil
 }
 
-func (r *Ranker) loadObjectsFromFile(filePath string, templateData string, forceJSON bool) (objects []object, err error) {
+func (r *Ranker) loadDocumentsFromFile(filePath string, templateData string, forceJSON bool) (documents []document, err error) {
 	var tmpl *template.Template
 	if templateData != "" {
 		if templateData[0] == '@' {
@@ -360,7 +360,7 @@ func (r *Ranker) loadObjectsFromFile(filePath string, templateData string, force
 			return nil, fmt.Errorf("failed to decode JSON from %s: %w", filePath, err)
 		}
 
-		// iterate over the map and create objects
+		// iterate over the map and create documents
 		for _, value := range data {
 			var valueStr string
 			if tmpl != nil {
@@ -370,7 +370,7 @@ func (r *Ranker) loadObjectsFromFile(filePath string, templateData string, force
 				}
 				valueStr = tmplData.String()
 			} else {
-				r.cfg.Logger.Warn("using json input without a template, using JSON object as it is")
+				r.cfg.Logger.Warn("using json input without a template, using JSON document as it is")
 				jsonValue, err := json.Marshal(value)
 				if err != nil {
 					return nil, fmt.Errorf("failed to marshal JSON value: %w", err)
@@ -379,7 +379,7 @@ func (r *Ranker) loadObjectsFromFile(filePath string, templateData string, force
 			}
 
 			id := ShortDeterministicID(valueStr, idLen)
-			objects = append(objects, object{ID: id, Object: value, Value: valueStr})
+			documents = append(documents, document{ID: id, Document: value, Value: valueStr})
 		}
 	} else {
 		// read and interpolate the file line by line
@@ -403,45 +403,45 @@ func (r *Ranker) loadObjectsFromFile(filePath string, templateData string, force
 			}
 
 			id := ShortDeterministicID(line, idLen)
-			objects = append(objects, object{ID: id, Object: nil, Value: line})
+			documents = append(documents, document{ID: id, Document: nil, Value: line})
 		}
 	}
 
-	return objects, nil
+	return documents, nil
 }
 
-// perform the ranking algorithm on the given objects
-func (r *Ranker) rank(objects []object, round int) []RankedObject {
+// perform the ranking algorithm on the given documents
+func (r *Ranker) rank(documents []document, round int) []RankedDocument {
 	r.round = round
 
-	r.cfg.Logger.Info("Ranking objects", "round", r.round, "count", len(objects))
+	r.cfg.Logger.Info("Ranking documents", "round", r.round, "count", len(documents))
 
-	// If we've narrowed down to a single object, we're done.
-	if len(objects) == 1 {
-		return []RankedObject{
+	// If we've narrowed down to a single document, we're done.
+	if len(documents) == 1 {
+		return []RankedDocument{
 			{
-				Key:      objects[0].ID,
-				Value:    objects[0].Value,
-				Object:   objects[0].Object,
+				Key:      documents[0].ID,
+				Value:    documents[0].Value,
+				Document: documents[0].Document,
 				Score:    0, // 0 is guaranteed to be the "highest" score.
 				Exposure: 1,
 			},
 		}
 	}
 
-	// Downstream ranking gets unhappy if we try to rank more objects than we
+	// Downstream ranking gets unhappy if we try to rank more documents than we
 	// have.
-	if r.cfg.BatchSize > len(objects) {
-		r.cfg.BatchSize = len(objects)
+	if r.cfg.BatchSize > len(documents) {
+		r.cfg.BatchSize = len(documents)
 	}
 
-	r.numBatches = len(objects) / r.cfg.BatchSize
+	r.numBatches = len(documents) / r.cfg.BatchSize
 
-	// Process the objects and get the sorted results.
-	results := r.shuffleBatchRank(objects)
+	// Process the documents and get the sorted results.
+	results := r.shuffleBatchRank(documents)
 
 	// If the refinement ratio is 0, that effectively means we're refining
-	// _none_ of the top objects, so we're done.
+	// _none_ of the top documents, so we're done.
 	if r.cfg.RefinementRatio == 0 {
 		return results
 	}
@@ -449,7 +449,7 @@ func (r *Ranker) rank(objects []object, round int) []RankedObject {
 	// Calculate the mid index based on the refinement ratio.
 	mid := int(float64(len(results)) * r.cfg.RefinementRatio)
 
-	// Ensure we have at least 2 objects for meaningful ranking
+	// Ensure we have at least 2 documents for meaningful ranking
 	// (you need at least 2 items to rank against each other)
 	if mid < 2 {
 		return results
@@ -458,23 +458,23 @@ func (r *Ranker) rank(objects []object, round int) []RankedObject {
 	topPortion := results[:mid]
 	bottomPortion := results[mid:]
 
-	// If we haven't reduced the number of objects (as may eventually happen
+	// If we haven't reduced the number of documents (as may eventually happen
 	// for a ratio above 0.5), we're done.
-	if len(topPortion) == len(objects) {
+	if len(topPortion) == len(documents) {
 		return results
 	}
 
 	r.cfg.Logger.Debug("Top items being sent back into recursion:")
-	for i, obj := range topPortion {
-		r.cfg.Logger.Debug("Recursive item", "rank", i+1, "id", obj.Key, "score", obj.Score, "value", obj.Value)
+	for i, doc := range topPortion {
+		r.cfg.Logger.Debug("Recursive item", "rank", i+1, "id", doc.Key, "score", doc.Score, "value", doc.Value)
 	}
 
-	var topPortionObjects []object
+	var topPortionDocs []document
 	for _, result := range topPortion {
-		topPortionObjects = append(topPortionObjects, object{ID: result.Key, Value: result.Value, Object: result.Object})
+		topPortionDocs = append(topPortionDocs, document{ID: result.Key, Value: result.Value, Document: result.Document})
 	}
 
-	refinedTopPortion := r.rank(topPortionObjects, round+1)
+	refinedTopPortion := r.rank(topPortionDocs, round+1)
 
 	// Adjust scores by recursion depth; this serves as an inverted weight so
 	// that later rounds are guaranteed to sit higher in the final list.
@@ -493,7 +493,7 @@ func (r *Ranker) logFromApiCall(trialNum, batchNum int, message string, args ...
 	r.cfg.Logger.Debug(formattedMessage, "round", r.round, "trial", trialNum, "total_trials", r.cfg.NumTrials, "batch", batchNum, "total_batches", r.numBatches)
 }
 
-func (r *Ranker) shuffleBatchRank(objects []object) []RankedObject {
+func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 	scores := make(map[string][]float64)
 	exposureCounts := make(map[string]int)
 	var scoresMutex sync.Mutex
@@ -501,14 +501,14 @@ func (r *Ranker) shuffleBatchRank(objects []object) []RankedObject {
 	type workItem struct {
 		trialNum int
 		batchNum int
-		batch    []object
+		batch    []document
 	}
 
 	type batchResult struct {
-		rankedObjects []rankedObject
-		err           error
-		trialNumber   int
-		batchNumber   int
+		rankedDocs  []rankedDocument
+		err         error
+		trialNumber int
+		batchNumber int
 	}
 
 	// Create cancellable context for early stopping
@@ -521,15 +521,15 @@ func (r *Ranker) shuffleBatchRank(objects []object) []RankedObject {
 	// Channel for results
 	resultsChan := make(chan batchResult, r.cfg.Concurrency)
 
-	var firstTrialRemainderItems []object
+	var firstTrialRemainderItems []document
 
 	// Load work queue depth-first (all of trial 1, then all of trial 2, etc.)
 	for trialNum := 1; trialNum <= r.cfg.NumTrials; trialNum++ {
-		// Shuffle objects for this trial
-		shuffledObjects := make([]object, len(objects))
-		copy(shuffledObjects, objects)
-		r.rng.Shuffle(len(shuffledObjects), func(i, j int) {
-			shuffledObjects[i], shuffledObjects[j] = shuffledObjects[j], shuffledObjects[i]
+		// Shuffle documents for this trial
+		shuffledDocs := make([]document, len(documents))
+		copy(shuffledDocs, documents)
+		r.rng.Shuffle(len(shuffledDocs), func(i, j int) {
+			shuffledDocs[i], shuffledDocs[j] = shuffledDocs[j], shuffledDocs[i]
 		})
 
 		// Ensure remainder items from the first trial are not in the remainder
@@ -537,7 +537,7 @@ func (r *Ranker) shuffleBatchRank(objects []object) []RankedObject {
 		if trialNum == 2 && len(firstTrialRemainderItems) > 0 {
 			for {
 				remainderStart := r.numBatches * r.cfg.BatchSize
-				remainderItems := shuffledObjects[remainderStart:]
+				remainderItems := shuffledDocs[remainderStart:]
 				conflictFound := false
 				for _, item := range remainderItems {
 					for _, firstTrialItem := range firstTrialRemainderItems {
@@ -555,8 +555,8 @@ func (r *Ranker) shuffleBatchRank(objects []object) []RankedObject {
 					break
 				}
 				// Re-shuffle if conflict found
-				r.rng.Shuffle(len(shuffledObjects), func(i, j int) {
-					shuffledObjects[i], shuffledObjects[j] = shuffledObjects[j], shuffledObjects[i]
+				r.rng.Shuffle(len(shuffledDocs), func(i, j int) {
+					shuffledDocs[i], shuffledDocs[j] = shuffledDocs[j], shuffledDocs[i]
 				})
 			}
 		}
@@ -564,16 +564,16 @@ func (r *Ranker) shuffleBatchRank(objects []object) []RankedObject {
 		// Save remainder items from the first trial
 		if trialNum == 1 {
 			remainderStart := r.numBatches * r.cfg.BatchSize
-			if remainderStart < len(shuffledObjects) {
-				firstTrialRemainderItems = make([]object, len(shuffledObjects[remainderStart:]))
-				copy(firstTrialRemainderItems, shuffledObjects[remainderStart:])
+			if remainderStart < len(shuffledDocs) {
+				firstTrialRemainderItems = make([]document, len(shuffledDocs[remainderStart:]))
+				copy(firstTrialRemainderItems, shuffledDocs[remainderStart:])
 				r.cfg.Logger.Debug("First trial remainder items", "items", firstTrialRemainderItems)
 			}
 		}
 
 		// Queue all batches for this trial
 		for batchNum := 0; batchNum < r.numBatches; batchNum++ {
-			batch := shuffledObjects[batchNum*r.cfg.BatchSize : (batchNum+1)*r.cfg.BatchSize]
+			batch := shuffledDocs[batchNum*r.cfg.BatchSize : (batchNum+1)*r.cfg.BatchSize]
 			workQueue <- workItem{
 				trialNum: trialNum,
 				batchNum: batchNum + 1, // 1-indexed for logging
@@ -605,17 +605,17 @@ func (r *Ranker) shuffleBatchRank(objects []object) []RankedObject {
 				r.semaphore <- struct{}{}
 
 				// Process batch
-				rankedBatch, err := r.rankObjects(work.batch, work.trialNum, work.batchNum)
+				rankedBatch, err := r.rankDocs(work.batch, work.trialNum, work.batchNum)
 
 				// Release semaphore
 				<-r.semaphore
 
 				// Send result
 				resultsChan <- batchResult{
-					rankedObjects: rankedBatch,
-					err:           err,
-					trialNumber:   work.trialNum,
-					batchNumber:   work.batchNum,
+					rankedDocs:  rankedBatch,
+					err:         err,
+					trialNumber: work.trialNum,
+					batchNumber: work.batchNum,
 				}
 			}
 		}()
@@ -639,9 +639,9 @@ func (r *Ranker) shuffleBatchRank(objects []object) []RankedObject {
 
 		// Thread-safe update of shared maps
 		scoresMutex.Lock()
-		for _, rankedObject := range result.rankedObjects {
-			scores[rankedObject.Object.ID] = append(scores[rankedObject.Object.ID], rankedObject.Score)
-			exposureCounts[rankedObject.Object.ID]++
+		for _, rankedDoc := range result.rankedDocs {
+			scores[rankedDoc.Document.ID] = append(scores[rankedDoc.Document.ID], rankedDoc.Score)
+			exposureCounts[rankedDoc.Document.ID]++
 		}
 		scoresMutex.Unlock()
 
@@ -671,14 +671,14 @@ func (r *Ranker) shuffleBatchRank(objects []object) []RankedObject {
 		finalScores[id] = sum / float64(len(scoreList))
 	}
 
-	var results []RankedObject
+	var results []RankedDocument
 	for id, score := range finalScores {
-		for _, obj := range objects {
-			if obj.ID == id {
-				results = append(results, RankedObject{
+		for _, doc := range documents {
+			if doc.ID == id {
+				results = append(results, RankedDocument{
 					Key:      id,
-					Value:    obj.Value,
-					Object:   obj.Object,
+					Value:    doc.Value,
+					Document: doc.Document,
 					Score:    score,
 					Exposure: exposureCounts[id],
 				})
@@ -708,15 +708,15 @@ func (r *Ranker) hasConverged(scores map[string][]float64, exposureCounts map[st
 	return false
 }
 
-func (r *Ranker) logTokenSizes(group []object) {
-	r.cfg.Logger.Debug("Logging token sizes for each object in the batch:")
-	for _, obj := range group {
-		tokenSize := r.estimateTokens([]object{obj}, false)
-		valuePreview := obj.Value
+func (r *Ranker) logTokenSizes(group []document) {
+	r.cfg.Logger.Debug("Logging token sizes for each document in the batch:")
+	for _, doc := range group {
+		tokenSize := r.estimateTokens([]document{doc}, false)
+		valuePreview := doc.Value
 		if len(valuePreview) > 100 {
 			valuePreview = valuePreview[:100]
 		}
-		r.cfg.Logger.Debug("Object token size", "id", obj.ID, "token_size", tokenSize, "value_preview", valuePreview)
+		r.cfg.Logger.Debug("Document token size", "id", doc.ID, "token_size", tokenSize, "value_preview", valuePreview)
 	}
 }
 
@@ -729,8 +729,8 @@ var promptDisclaimer = "\n\nREMEMBER to:\n" +
 	"— NEVER include backticks around IDs in your response!\n" +
 	"— NEVER include scores or a written reason/justification in your response!\n" +
 	"- Respond in RANKED DESCENDING order, where the FIRST item in your response is the MOST RELEVANT\n" +
-	"- Respond in JSON format, with the following schema:\n  {\"objects\": [\"<ID1>\", \"<ID2>\", ...]}\n\n" +
-	"Here are the objects to be ranked:\n\n"
+	"- Respond in JSON format, with the following schema:\n  {\"docs\": [\"<ID1>\", \"<ID2>\", ...]}\n\n" +
+	"Here are the documents to be ranked:\n\n"
 
 const missingIDsStr = "Your last response was missing the following IDs: [%s]. " +
 	"Try again—and make ABSOLUTELY SURE to remember to:\n" +
@@ -742,30 +742,30 @@ const missingIDsStr = "Your last response was missing the following IDs: [%s]. "
 
 const invalidJSONStr = "Your last response was not valid JSON. Try again!"
 
-func (r *Ranker) estimateTokens(group []object, includePrompt bool) int {
+func (r *Ranker) estimateTokens(group []document, includePrompt bool) int {
 	text := ""
 	if includePrompt {
 		text += r.cfg.InitialPrompt + promptDisclaimer
 	}
-	for _, obj := range group {
-		text += fmt.Sprintf(promptFmt, obj.ID, obj.Value)
+	for _, doc := range group {
+		text += fmt.Sprintf(promptFmt, doc.ID, doc.Value)
 	}
 
 	return len(r.encoding.Encode(text, nil, nil))
 }
 
-func (r *Ranker) rankObjects(group []object, trialNumber int, batchNumber int) ([]rankedObject, error) {
+func (r *Ranker) rankDocs(group []document, trialNumber int, batchNumber int) ([]rankedDocument, error) {
 	if r.cfg.DryRun {
 		r.cfg.Logger.Debug("Dry run API call")
 		// Simulate a ranked response for dry run
-		var rankedObjects []rankedObject
-		for i, obj := range group {
-			rankedObjects = append(rankedObjects, rankedObject{
-				Object: obj,
-				Score:  float64(i + 1), // Simulate scores based on position
+		var rankedDocs []rankedDocument
+		for i, doc := range group {
+			rankedDocs = append(rankedDocs, rankedDocument{
+				Document: doc,
+				Score:    float64(i + 1), // Simulate scores based on position
 			})
 		}
-		return rankedObjects, nil
+		return rankedDocs, nil
 	}
 
 	maxRetries := 10
@@ -779,20 +779,20 @@ func (r *Ranker) rankObjects(group []object, trialNumber int, batchNumber int) (
 
 		if useMemorableIDs {
 			// Use memorable IDs in the prompt
-			for _, obj := range group {
-				tempID := originalToTemp[obj.ID]
-				prompt += fmt.Sprintf(promptFmt, tempID, obj.Value)
+			for _, doc := range group {
+				tempID := originalToTemp[doc.ID]
+				prompt += fmt.Sprintf(promptFmt, tempID, doc.Value)
 				inputIDs[tempID] = true
 			}
 		} else {
 			// Fall back to original IDs
-			for _, obj := range group {
-				prompt += fmt.Sprintf(promptFmt, obj.ID, obj.Value)
-				inputIDs[obj.ID] = true
+			for _, doc := range group {
+				prompt += fmt.Sprintf(promptFmt, doc.ID, doc.Value)
+				inputIDs[doc.ID] = true
 			}
 		}
 
-		var rankedResponse rankedObjectResponse
+		var rankedResponse rankedDocumentResponse
 		rankedResponse, err = r.callOpenAI(prompt, trialNumber, batchNumber, inputIDs)
 		if err != nil {
 			if attempt == maxRetries-1 {
@@ -809,10 +809,10 @@ func (r *Ranker) rankObjects(group []object, trialNumber int, batchNumber int) (
 
 		// Check if we got all expected IDs
 		expectedIDs := make(map[string]bool)
-		for _, obj := range group {
-			expectedIDs[obj.ID] = true
+		for _, doc := range group {
+			expectedIDs[doc.ID] = true
 		}
-		for _, id := range rankedResponse.Objects {
+		for _, id := range rankedResponse.Documents {
 			delete(expectedIDs, id)
 		}
 
@@ -829,20 +829,20 @@ func (r *Ranker) rankObjects(group []object, trialNumber int, batchNumber int) (
 		}
 
 		// Success! Assign scores based on position in the ranked list
-		var rankedObjects []rankedObject
-		for i, id := range rankedResponse.Objects {
-			for _, obj := range group {
-				if obj.ID == id {
-					rankedObjects = append(rankedObjects, rankedObject{
-						Object: obj,
-						Score:  float64(i + 1), // Score based on position (1 for first, 2 for second, etc.)
+		var rankedDocs []rankedDocument
+		for i, id := range rankedResponse.Documents {
+			for _, doc := range group {
+				if doc.ID == id {
+					rankedDocs = append(rankedDocs, rankedDocument{
+						Document: doc,
+						Score:    float64(i + 1), // Score based on position (1 for first, 2 for second, etc.)
 					})
 					break
 				}
 			}
 		}
 
-		return rankedObjects, nil
+		return rankedDocs, nil
 	}
 
 	return nil, fmt.Errorf("failed after %d attempts", maxRetries)
@@ -876,7 +876,7 @@ func (t *customTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 // validateIDs updates the rankedResponse in place to fix case-insensitive ID mismatches.
 // If any IDs are missing, returns the missing IDs along with an error.
-func validateIDs(rankedResponse *rankedObjectResponse, inputIDs map[string]bool) ([]string, error) {
+func validateIDs(rankedResponse *rankedDocumentResponse, inputIDs map[string]bool) ([]string, error) {
 	// Create a map for case-insensitive ID matching
 	inputIDsLower := make(map[string]string)
 	for id := range inputIDs {
@@ -888,13 +888,13 @@ func validateIDs(rankedResponse *rankedObjectResponse, inputIDs map[string]bool)
 		missingIDs[id] = true
 	}
 
-	for i, id := range rankedResponse.Objects {
+	for i, id := range rankedResponse.Documents {
 		id = strings.ReplaceAll(id, "`", "")
 		lowerID := strings.ToLower(id)
 		if correctID, found := inputIDsLower[lowerID]; found {
 			if correctID != id {
 				// Replace the case-wrong match with the correct ID
-				rankedResponse.Objects[i] = correctID
+				rankedResponse.Documents[i] = correctID
 			}
 			delete(missingIDs, correctID)
 		}
@@ -911,7 +911,7 @@ func validateIDs(rankedResponse *rankedObjectResponse, inputIDs map[string]bool)
 	}
 }
 
-func (r *Ranker) callOpenAI(prompt string, trialNum int, batchNum int, inputIDs map[string]bool) (rankedObjectResponse, error) {
+func (r *Ranker) callOpenAI(prompt string, trialNum int, batchNum int, inputIDs map[string]bool) (rankedDocumentResponse, error) {
 
 	customTransport := &customTransport{Transport: http.DefaultTransport}
 	customClient := &http.Client{Transport: customTransport}
@@ -940,7 +940,7 @@ func (r *Ranker) callOpenAI(prompt string, trialNum int, batchNum int, inputIDs 
 		openai.UserMessage(prompt),
 	}
 
-	var rankedResponse rankedObjectResponse
+	var rankedResponse rankedDocumentResponse
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -950,9 +950,9 @@ func (r *Ranker) callOpenAI(prompt string, trialNum int, batchNum int, inputIDs 
 			ResponseFormat: openai.ChatCompletionNewParamsResponseFormatUnion{
 				OfJSONSchema: &shared.ResponseFormatJSONSchemaParam{
 					JSONSchema: shared.ResponseFormatJSONSchemaJSONSchemaParam{
-						Name:        "ranked_object_response",
-						Description: openai.String("List of ranked object IDs"),
-						Schema:      rankedObjectResponseSchema,
+						Name:        "ranked_document_response",
+						Description: openai.String("List of ranked document IDs"),
+						Schema:      rankedDocumentResponseSchema,
 						Strict:      openai.Bool(true),
 					},
 				},
@@ -1030,7 +1030,7 @@ func (r *Ranker) callOpenAI(prompt string, trialNum int, batchNum int, inputIDs 
 				backoff *= 2
 			}
 		} else {
-			return rankedObjectResponse{}, fmt.Errorf("trial %*d/%d, batch %*d/%d: unexpected error: %w", len(strconv.Itoa(r.cfg.NumTrials)), trialNum, r.cfg.NumTrials, len(strconv.Itoa(r.numBatches)), batchNum, r.numBatches, err)
+			return rankedDocumentResponse{}, fmt.Errorf("trial %*d/%d, batch %*d/%d: unexpected error: %w", len(strconv.Itoa(r.cfg.NumTrials)), trialNum, r.cfg.NumTrials, len(strconv.Itoa(r.numBatches)), batchNum, r.numBatches, err)
 		}
 	}
 }
