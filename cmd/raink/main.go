@@ -18,6 +18,7 @@ func main() {
 	inputTemplate := flag.String("template", "{{.Data}}", "Template for each object in the input file (prefix with @ to use a file)")
 	batchSize := flag.Int("s", 10, "Number of items per batch")
 	numRuns := flag.Int("r", 3, "Number of runs")
+	concurrency := flag.Int("c", 20, "Max concurrent LLM calls across all runs")
 	batchTokens := flag.Int("t", 128000, "Max tokens per batch")
 	initialPrompt := flag.String("p", "", "Initial prompt (prefix with @ to use a file)")
 	outputFile := flag.String("o", "", "JSON output file")
@@ -70,6 +71,7 @@ func main() {
 		InitialPrompt:   userPrompt,
 		BatchSize:       *batchSize,
 		NumRuns:         *numRuns,
+		Concurrency:     *concurrency,
 		OpenAIModel:     *oaiModel,
 		TokenLimit:      tokenLimitThreshold,
 		RefinementRatio: *refinementRatio,

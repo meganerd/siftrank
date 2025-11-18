@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -73,6 +74,7 @@ type Config struct {
 	InitialPrompt   string           `json:"initial_prompt"`
 	BatchSize       int              `json:"batch_size"`
 	NumRuns         int              `json:"num_runs"`
+	Concurrency     int              `json:"concurrency"`
 	OpenAIModel     openai.ChatModel `json:"openai_model"`
 	TokenLimit      int              `json:"token_limit"`
 	RefinementRatio float64          `json:"refinement_ratio"`
@@ -95,6 +97,9 @@ func (c *Config) Validate() error {
 	if c.NumRuns <= 0 {
 		return fmt.Errorf("number of runs must be greater than 0")
 	}
+	if c.Concurrency <= 0 {
+		return fmt.Errorf("concurrency must be greater than 0")
+	}
 	if c.TokenLimit <= 0 {
 		return fmt.Errorf("token limit must be greater than 0")
 	}
@@ -113,6 +118,7 @@ type Ranker struct {
 	rng        *rand.Rand
 	numBatches int
 	round      int
+	semaphore  chan struct{} // Global concurrency limiter
 }
 
 func NewRanker(config *Config) (*Ranker, error) {
@@ -134,9 +140,10 @@ func NewRanker(config *Config) (*Ranker, error) {
 	}
 
 	return &Ranker{
-		cfg:      config,
-		encoding: encoding,
-		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
+		cfg:       config,
+		encoding:  encoding,
+		rng:       rand.New(rand.NewSource(time.Now().UnixNano())),
+		semaphore: make(chan struct{}, config.Concurrency),
 	}, nil
 }
 
@@ -488,28 +495,49 @@ func (r *Ranker) logFromApiCall(runNum, batchNum int, message string, args ...in
 
 func (r *Ranker) shuffleBatchRank(objects []object) []RankedObject {
 	scores := make(map[string][]float64)
-
 	exposureCounts := make(map[string]int)
+	var scoresMutex sync.Mutex
+
+	type workItem struct {
+		runNum   int
+		batchNum int
+		batch    []object
+	}
 
 	type batchResult struct {
 		rankedObjects []rankedObject
 		err           error
+		runNumber     int
+		batchNumber   int
 	}
-	resultsChan := make(chan batchResult, r.numBatches)
+
+	// Create cancellable context for early stopping
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // Ensure cleanup
+
+	// Channel for work items (sized for all batches across all runs)
+	workQueue := make(chan workItem, r.numBatches*r.cfg.NumRuns)
+
+	// Channel for results
+	resultsChan := make(chan batchResult, r.cfg.Concurrency)
 
 	var firstRunRemainderItems []object
 
-	for i := 0; i < r.cfg.NumRuns; i++ {
-		r.rng.Shuffle(len(objects), func(i, j int) {
-			objects[i], objects[j] = objects[j], objects[i]
+	// Load work queue depth-first (all of run 1, then all of run 2, etc.)
+	for runNum := 1; runNum <= r.cfg.NumRuns; runNum++ {
+		// Shuffle objects for this run
+		shuffledObjects := make([]object, len(objects))
+		copy(shuffledObjects, objects)
+		r.rng.Shuffle(len(shuffledObjects), func(i, j int) {
+			shuffledObjects[i], shuffledObjects[j] = shuffledObjects[j], shuffledObjects[i]
 		})
 
 		// Ensure remainder items from the first run are not in the remainder
 		// range in the second run
-		if i == 1 && len(firstRunRemainderItems) > 0 {
+		if runNum == 2 && len(firstRunRemainderItems) > 0 {
 			for {
 				remainderStart := r.numBatches * r.cfg.BatchSize
-				remainderItems := objects[remainderStart:]
+				remainderItems := shuffledObjects[remainderStart:]
 				conflictFound := false
 				for _, item := range remainderItems {
 					for _, firstRunItem := range firstRunRemainderItems {
@@ -526,42 +554,109 @@ func (r *Ranker) shuffleBatchRank(objects []object) []RankedObject {
 				if !conflictFound {
 					break
 				}
-				r.rng.Shuffle(len(objects), func(i, j int) {
-					objects[i], objects[j] = objects[j], objects[i]
+				// Re-shuffle if conflict found
+				r.rng.Shuffle(len(shuffledObjects), func(i, j int) {
+					shuffledObjects[i], shuffledObjects[j] = shuffledObjects[j], shuffledObjects[i]
 				})
 			}
 		}
 
-		// Split into groups of batchSize and process them concurrently
-		r.cfg.Logger.Debug("Submitting batches to API", "round", r.round, "run", i+1, "total_runs", r.cfg.NumRuns)
-		for j := 0; j < r.numBatches; j++ {
-			batch := objects[j*r.cfg.BatchSize : (j+1)*r.cfg.BatchSize]
-			go func(runNumber, batchNumber int, batch []object) {
-				rankedBatch, err := r.rankObjects(batch, runNumber, batchNumber)
-				resultsChan <- batchResult{rankedObjects: rankedBatch, err: err}
-			}(i+1, j+1, batch)
-		}
-
-		// Collect results from all batches
-		for j := 0; j < r.numBatches; j++ {
-			result := <-resultsChan
-			if result.err != nil {
-				r.cfg.Logger.Error("Error in batch processing", "error", result.err)
-				continue // Skip this batch but continue with others
-			}
-			for _, rankedObject := range result.rankedObjects {
-				scores[rankedObject.Object.ID] = append(scores[rankedObject.Object.ID], rankedObject.Score)
-				exposureCounts[rankedObject.Object.ID]++ // Update exposure count
-			}
-		}
-
 		// Save remainder items from the first run
-		if i == 0 {
+		if runNum == 1 {
 			remainderStart := r.numBatches * r.cfg.BatchSize
-			if remainderStart < len(objects) {
-				firstRunRemainderItems = make([]object, len(objects[remainderStart:]))
-				copy(firstRunRemainderItems, objects[remainderStart:])
+			if remainderStart < len(shuffledObjects) {
+				firstRunRemainderItems = make([]object, len(shuffledObjects[remainderStart:]))
+				copy(firstRunRemainderItems, shuffledObjects[remainderStart:])
 				r.cfg.Logger.Debug("First run remainder items", "items", firstRunRemainderItems)
+			}
+		}
+
+		// Queue all batches for this run
+		for batchNum := 0; batchNum < r.numBatches; batchNum++ {
+			batch := shuffledObjects[batchNum*r.cfg.BatchSize : (batchNum+1)*r.cfg.BatchSize]
+			workQueue <- workItem{
+				runNum:   runNum,
+				batchNum: batchNum + 1, // 1-indexed for logging
+				batch:    batch,
+			}
+		}
+	}
+	close(workQueue) // No more work will be added
+
+	// Launch worker pool
+	var workersWg sync.WaitGroup
+	for i := 0; i < r.cfg.Concurrency; i++ {
+		workersWg.Add(1)
+		go func() {
+			defer workersWg.Done()
+
+			for work := range workQueue {
+				// Check if we should stop (context cancelled due to convergence)
+				select {
+				case <-ctx.Done():
+					r.cfg.Logger.Debug("Worker stopping due to convergence",
+						"run", work.runNum, "batch", work.batchNum)
+					continue // Skip this work item
+				default:
+					// Continue processing
+				}
+
+				// Acquire semaphore
+				r.semaphore <- struct{}{}
+
+				// Process batch
+				rankedBatch, err := r.rankObjects(work.batch, work.runNum, work.batchNum)
+
+				// Release semaphore
+				<-r.semaphore
+
+				// Send result
+				resultsChan <- batchResult{
+					rankedObjects: rankedBatch,
+					err:           err,
+					runNumber:     work.runNum,
+					batchNumber:   work.batchNum,
+				}
+			}
+		}()
+	}
+
+	// Close results channel when all workers are done
+	go func() {
+		workersWg.Wait()
+		close(resultsChan)
+	}()
+
+	// Track run completion
+	completedBatches := make(map[int]int) // runNum -> count of completed batches
+
+	// Collect results
+	for result := range resultsChan {
+		if result.err != nil {
+			r.cfg.Logger.Error("Error in batch processing", "error", result.err)
+			continue
+		}
+
+		// Thread-safe update of shared maps
+		scoresMutex.Lock()
+		for _, rankedObject := range result.rankedObjects {
+			scores[rankedObject.Object.ID] = append(scores[rankedObject.Object.ID], rankedObject.Score)
+			exposureCounts[rankedObject.Object.ID]++
+		}
+		scoresMutex.Unlock()
+
+		// Track run completion
+		completedBatches[result.runNumber]++
+
+		// Check if this run just completed
+		if completedBatches[result.runNumber] == r.numBatches {
+			r.cfg.Logger.Info("Run completed", "run", result.runNumber)
+
+			// Check for convergence
+			if r.hasConverged(scores, exposureCounts, result.runNumber) {
+				r.cfg.Logger.Info("Convergence detected, stopping early", "run", result.runNumber)
+				cancel() // Signal all workers to stop processing new work
+				// break    // Stop collecting results
 			}
 		}
 	}
@@ -585,7 +680,7 @@ func (r *Ranker) shuffleBatchRank(objects []object) []RankedObject {
 					Value:    obj.Value,
 					Object:   obj.Object,
 					Score:    score,
-					Exposure: exposureCounts[id], // Include exposure count
+					Exposure: exposureCounts[id],
 				})
 				break
 			}
@@ -597,6 +692,20 @@ func (r *Ranker) shuffleBatchRank(objects []object) []RankedObject {
 	})
 
 	return results
+}
+
+// hasConverged checks if the ranking has stabilized across runs
+// Returns true if early stopping should occur
+func (r *Ranker) hasConverged(scores map[string][]float64, exposureCounts map[string]int, completedRunNum int) bool {
+	// FUTURE: Implement convergence detection
+	// Could check:
+	// - Standard deviation of scores for each item
+	// - Rank position stability across recent runs
+	// - Score differences between consecutive runs
+	// - Minimum number of runs completed before allowing convergence
+
+	// For now, never converge early
+	return false
 }
 
 func (r *Ranker) logTokenSizes(group []object) {

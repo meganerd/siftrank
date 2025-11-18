@@ -20,6 +20,7 @@ func TestNewRanker(t *testing.T) {
 				InitialPrompt:   "test prompt",
 				BatchSize:       5,
 				NumRuns:         2,
+				Concurrency:     20,
 				OpenAIModel:     openai.ChatModelGPT4oMini,
 				TokenLimit:      1000,
 				RefinementRatio: 0.5,
@@ -104,6 +105,7 @@ func TestRankFromFile_DryRun(t *testing.T) {
 		InitialPrompt:   "Rank by alphabetical order",
 		BatchSize:       3, // Set to 3 to include all items
 		NumRuns:         1,
+		Concurrency:     20,
 		OpenAIModel:     openai.ChatModelGPT4oMini,
 		TokenLimit:      1000,
 		RefinementRatio: 0.0, // Set to 0.0 to disable refinement and keep all results
@@ -172,6 +174,7 @@ func TestRankFromFile_WithSentencesData(t *testing.T) {
 		InitialPrompt:   `Rank each of these items according to their relevancy to the concept of "time".`,
 		BatchSize:       10,
 		NumRuns:         3,
+		Concurrency:     20,
 		OpenAIModel:     openai.ChatModelGPT4oMini,
 		TokenLimit:      100000,
 		RefinementRatio: 0.5,
@@ -275,6 +278,7 @@ func TestRankFromFile_Errors(t *testing.T) {
 		InitialPrompt:   "test prompt",
 		BatchSize:       5,
 		NumRuns:         3,
+		Concurrency:     20,
 		OpenAIModel:     openai.ChatModelGPT4oMini,
 		TokenLimit:      1000,
 		RefinementRatio: 0.5,
