@@ -132,17 +132,19 @@ func (c *Config) Validate() error {
 }
 
 type Ranker struct {
-	cfg            *Config
-	encoding       *tiktoken.Tiktoken
-	rng            *rand.Rand
-	numBatches     int
-	round          int
-	semaphore      chan struct{} // Global concurrency limiter
-	elbowPositions []int         // Track elbow position after each trial
-	rankingOrders  [][]string    // Track full ranking order per trial
-	mu             sync.Mutex    // Protect elbowPositions, rankingOrders, and converged
-	converged      bool          // Track if convergence already detected
-	elbowCutoff    int           // Cutoff position for refinement
+	cfg              *Config
+	encoding         *tiktoken.Tiktoken
+	rng              *rand.Rand
+	numBatches       int
+	round            int
+	semaphore        chan struct{}                 // Global concurrency limiter
+	elbowPositions   []int                         // Track elbow position after each trial
+	rankingOrders    [][]string                    // Track full ranking order per trial
+	mu               sync.Mutex                    // Protect elbowPositions, rankingOrders, converged, and comparedAgainst
+	converged        bool                          // Track if convergence already detected
+	elbowCutoff      int                           // Cutoff position for refinement
+	originalDocCount int                           // Track original dataset size for exposure calculation
+	comparedAgainst  map[string]map[string]bool    // Track which docs each was compared against (across ALL rounds/trials)
 }
 
 func NewRanker(config *Config) (*Ranker, error) {
@@ -235,7 +237,7 @@ type RankedDocument struct {
 	Value    string      `json:"value"`
 	Document interface{} `json:"document"` // if loading from json file
 	Score    float64     `json:"score"`
-	Exposure int         `json:"exposure"`
+	Exposure float64     `json:"exposure"` // percentage of dataset compared against (0.0-1.0)
 	Rank     int         `json:"rank"`
 	Rounds   int         `json:"rounds"` // number of rounds participated in
 }
@@ -346,11 +348,24 @@ func (r *Ranker) RankFromFile(filePath string, templateData string, forceJSON bo
 		return nil, err
 	}
 
+	// Initialize global comparison tracking for exposure calculation
+	r.comparedAgainst = make(map[string]map[string]bool)
+
 	results := r.rank(documents, 1)
 
-	// Add the rank key to each final result based on its position in the list
+	// Calculate final exposure percentages across all rounds/trials
 	for i := range results {
+		// Add rank
 		results[i].Rank = i + 1
+
+		// Calculate exposure as percentage of original dataset
+		uniqueComparisons := float64(len(r.comparedAgainst[results[i].Key]))
+		totalPossible := float64(r.originalDocCount - 1) // Exclude self
+		if totalPossible > 0 {
+			results[i].Exposure = uniqueComparisons / totalPossible
+		} else {
+			results[i].Exposure = 1.0 // Edge case: single document
+		}
 	}
 
 	return results, nil
@@ -439,6 +454,11 @@ func (r *Ranker) loadDocumentsFromFile(filePath string, templateData string, for
 func (r *Ranker) rank(documents []document, round int) []RankedDocument {
 	r.round = round
 
+	// Track original document count for exposure calculation
+	if round == 1 {
+		r.originalDocCount = len(documents)
+	}
+
 	r.cfg.Logger.Info("Ranking documents", "round", r.round, "count", len(documents))
 
 	// If we've narrowed down to a single document, we're done.
@@ -448,8 +468,8 @@ func (r *Ranker) rank(documents []document, round int) []RankedDocument {
 				Key:      documents[0].ID,
 				Value:    documents[0].Value,
 				Document: documents[0].Document,
-				Score:    0, // 0 is guaranteed to be the "highest" score.
-				Exposure: 1,
+				Score:    0,   // 0 is guaranteed to be the "highest" score.
+				Exposure: 1.0, // 100% exposure (single document)
 				Rounds:   round,
 			},
 		}
@@ -551,7 +571,6 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 	r.mu.Unlock()
 
 	scores := make(map[string][]float64)
-	exposureCounts := make(map[string]int)
 	var scoresMutex sync.Mutex
 
 	type workItem struct {
@@ -701,9 +720,24 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 		scoresMutex.Lock()
 		for _, rankedDoc := range result.rankedDocs {
 			scores[rankedDoc.Document.ID] = append(scores[rankedDoc.Document.ID], rankedDoc.Score)
-			exposureCounts[rankedDoc.Document.ID]++
 		}
 		scoresMutex.Unlock()
+
+		// Track comparisons globally (across all rounds/trials)
+		r.mu.Lock()
+		for _, rankedDoc := range result.rankedDocs {
+			// Track which documents this was compared against
+			if r.comparedAgainst[rankedDoc.Document.ID] == nil {
+				r.comparedAgainst[rankedDoc.Document.ID] = make(map[string]bool)
+			}
+			// Add all OTHER documents from this batch to the compared-against set
+			for _, otherDoc := range result.rankedDocs {
+				if otherDoc.Document.ID != rankedDoc.Document.ID {
+					r.comparedAgainst[rankedDoc.Document.ID][otherDoc.Document.ID] = true
+				}
+			}
+		}
+		r.mu.Unlock()
 
 		// Track trial completion
 		completedBatches[result.trialNumber]++
@@ -713,7 +747,7 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 			r.cfg.Logger.Info("Trial completed", "round", r.round, "trial", result.trialNumber)
 
 			// Check for convergence
-			if r.hasConverged(scores, exposureCounts, result.trialNumber) {
+			if r.hasConverged(scores, result.trialNumber) {
 				// No need to log here - hasConverged() already logged if it's the first detection
 				cancel() // Signal all workers to stop processing new work
 			}
@@ -722,6 +756,7 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 
 	// Calculate average scores
 	finalScores := make(map[string]float64)
+
 	for id, scoreList := range scores {
 		var sum float64
 		for _, score := range scoreList {
@@ -739,7 +774,7 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 					Value:    doc.Value,
 					Document: doc.Document,
 					Score:    score,
-					Exposure: exposureCounts[id],
+					Exposure: 0.0, // Will be calculated at the end in RankFromFile
 					Rounds:   r.round,
 				})
 				break
@@ -882,7 +917,7 @@ func (r *Ranker) isRankingStable() (bool, int) {
 
 // hasConverged checks if the ranking has stabilized across trials
 // Returns true if early stopping should occur
-func (r *Ranker) hasConverged(scores map[string][]float64, exposureCounts map[string]int, completedTrialNum int) bool {
+func (r *Ranker) hasConverged(scores map[string][]float64, completedTrialNum int) bool {
 	// Early stopping disabled
 	if !r.cfg.EnableConvergence {
 		return false
