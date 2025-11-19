@@ -78,7 +78,6 @@ type Config struct {
 	NumTrials       int              `json:"num_trials"`
 	Concurrency     int              `json:"concurrency"`
 	OpenAIModel     openai.ChatModel `json:"openai_model"`
-	TokenLimit      int              `json:"token_limit"`
 	RefinementRatio float64          `json:"refinement_ratio"`
 	OpenAIKey       string           `json:"-"`
 	OpenAIAPIURL    string           `json:"-"`
@@ -108,8 +107,8 @@ func (c *Config) Validate() error {
 	if c.Concurrency <= 0 {
 		return fmt.Errorf("concurrency must be greater than 0")
 	}
-	if c.TokenLimit <= 0 {
-		return fmt.Errorf("token limit must be greater than 0")
+	if c.BatchTokens <= 0 {
+		return fmt.Errorf("batch tokens must be greater than 0")
 	}
 	if c.OpenAIAPIURL == "" && c.OpenAIKey == "" {
 		return fmt.Errorf("openai key cannot be empty")
@@ -173,48 +172,61 @@ func NewRanker(config *Config) (*Ranker, error) {
 	}, nil
 }
 
-// dynamically adjust batch size to fit within token limits
-func (ranker *Ranker) adjustBatchSize(documents []document, samples int) error {
-	// Dynamically adjust batch size upfront.
-	for {
-		valid := true
-		var estTotalTokens int
-		var numBatches int
+// adjustBatchSize dynamically adjusts batch size to fit within token limits
+// by testing the worst case: the N largest documents
+func (ranker *Ranker) adjustBatchSize(documents []document) error {
+	// Calculate token size for each document
+	docSizes := make([]struct {
+		doc    document
+		tokens int
+	}, len(documents))
 
-		for i := 0; i < samples; i++ {
-			ranker.rng.Shuffle(len(documents), func(i, j int) {
-				documents[i], documents[j] = documents[j], documents[i]
-			})
-			numBatches = max(1, len(documents)/ranker.cfg.BatchSize) // Need at least one batch.
-			for j := 0; j < numBatches; j++ {
-				batch := documents[j*ranker.cfg.BatchSize : (j+1)*min(len(documents), ranker.cfg.BatchSize)] // Don't index more documents than we have.
-				estBatchTokens := ranker.estimateTokens(batch, true)
-				estTotalTokens += estBatchTokens
-				if estBatchTokens > ranker.cfg.TokenLimit {
-					ranker.cfg.Logger.Debug("Sample exceeded token threshold - estimated tokens > max limit", "sample", i, "estimated_tokens", estBatchTokens, "max_threshold", ranker.cfg.TokenLimit)
-					ranker.logTokenSizes(batch)
-					valid = false
-					break
-				}
-			}
-			if !valid {
-				break
-			}
-		}
-
-		if valid {
-			avgEstTokens := estTotalTokens / (samples * numBatches)
-			avgEstPct := float64(avgEstTokens) / float64(ranker.cfg.TokenLimit) * 100
-			ranker.cfg.Logger.Debug("Average estimated tokens calculated", "tokens", avgEstTokens, "percentage_of_max", avgEstPct, "max_tokens", ranker.cfg.TokenLimit)
-			break
-		}
-		if ranker.cfg.BatchSize <= minBatchSize {
-			return fmt.Errorf("cannot create a valid batch within the token limit")
-		}
-		ranker.cfg.BatchSize--
-		ranker.cfg.Logger.Debug("Decreasing batch size to fit within token limits", "new_size", ranker.cfg.BatchSize)
+	for i, doc := range documents {
+		docSizes[i].doc = doc
+		docSizes[i].tokens = ranker.estimateTokens([]document{doc}, false)
 	}
-	return nil
+
+	// Sort by token size descending (largest first)
+	sort.Slice(docSizes, func(i, j int) bool {
+		return docSizes[i].tokens > docSizes[j].tokens
+	})
+
+	// Try to fit the N largest documents in a batch
+	for {
+		// Take the N largest documents (worst case)
+		batchSize := min(ranker.cfg.BatchSize, len(docSizes))
+		largestDocs := make([]document, batchSize)
+		for i := 0; i < batchSize; i++ {
+			largestDocs[i] = docSizes[i].doc
+		}
+
+		// Estimate tokens for this worst-case batch
+		estBatchTokens := ranker.estimateTokens(largestDocs, true)
+
+		if estBatchTokens <= ranker.cfg.BatchTokens {
+			// Success! The largest documents fit
+			ranker.cfg.Logger.Debug("Batch size validated",
+				"batch_size", ranker.cfg.BatchSize,
+				"worst_case_tokens", estBatchTokens,
+				"max_tokens", ranker.cfg.BatchTokens,
+				"utilization_pct", float64(estBatchTokens)/float64(ranker.cfg.BatchTokens)*100)
+			return nil
+		}
+
+		// Batch too large - log details and decrease size
+		ranker.cfg.Logger.Debug("Batch exceeds token limit",
+			"batch_size", ranker.cfg.BatchSize,
+			"estimated_tokens", estBatchTokens,
+			"max_tokens", ranker.cfg.BatchTokens)
+		ranker.logTokenSizes(largestDocs)
+
+		if ranker.cfg.BatchSize <= minBatchSize {
+			return fmt.Errorf("cannot create a valid batch within the token limit (even with batch size %d)", minBatchSize)
+		}
+
+		ranker.cfg.BatchSize--
+		ranker.cfg.Logger.Debug("Decreasing batch size", "new_size", ranker.cfg.BatchSize)
+	}
 }
 
 type document struct {
@@ -344,7 +356,7 @@ func (r *Ranker) RankFromFile(filePath string, templateData string, forceJSON bo
 		}
 	}
 
-	if err := r.adjustBatchSize(documents, 10); err != nil {
+	if err := r.adjustBatchSize(documents); err != nil {
 		return nil, err
 	}
 

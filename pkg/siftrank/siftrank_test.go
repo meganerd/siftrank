@@ -22,7 +22,6 @@ func TestNewRanker(t *testing.T) {
 				NumTrials:       2,
 				Concurrency:     20,
 				OpenAIModel:     openai.ChatModelGPT4oMini,
-				TokenLimit:      1000,
 				RefinementRatio: 0.5,
 				OpenAIKey:       "test-key",
 				Encoding:        "o200k_base",
@@ -38,7 +37,7 @@ func TestNewRanker(t *testing.T) {
 				BatchSize:     5,
 				NumTrials:     2,
 				OpenAIModel:   openai.ChatModelGPT4oMini,
-				TokenLimit:    1000,
+				BatchTokens:   1000,
 				OpenAIKey:     "test-key",
 				Encoding:      "o200k_base",
 			},
@@ -51,7 +50,7 @@ func TestNewRanker(t *testing.T) {
 				BatchSize:     1, // Less than minBatchSize (2)
 				NumTrials:     2,
 				OpenAIModel:   openai.ChatModelGPT4oMini,
-				TokenLimit:    1000,
+				BatchTokens:   1000,
 				OpenAIKey:     "test-key",
 				Encoding:      "o200k_base",
 			},
@@ -64,7 +63,7 @@ func TestNewRanker(t *testing.T) {
 				BatchSize:     5,
 				NumTrials:     2,
 				OpenAIModel:   openai.ChatModelGPT4oMini,
-				TokenLimit:    1000,
+				BatchTokens:   1000,
 				OpenAIKey:     "", // Empty key
 				Encoding:      "o200k_base",
 			},
@@ -107,7 +106,6 @@ func TestRankFromFile_DryRun(t *testing.T) {
 		NumTrials:       1,
 		Concurrency:     20,
 		OpenAIModel:     openai.ChatModelGPT4oMini,
-		TokenLimit:      1000,
 		RefinementRatio: 0.0, // Set to 0.0 to disable refinement and keep all results
 		OpenAIKey:       "test-key",
 		Encoding:        "o200k_base",
@@ -176,7 +174,6 @@ func TestRankFromFile_WithSentencesData(t *testing.T) {
 		NumTrials:       3,
 		Concurrency:     20,
 		OpenAIModel:     openai.ChatModelGPT4oMini,
-		TokenLimit:      100000,
 		RefinementRatio: 0.5,
 		OpenAIKey:       "test-key", // This would normally come from environment
 		Encoding:        "o200k_base",
@@ -280,7 +277,6 @@ func TestRankFromFile_Errors(t *testing.T) {
 		NumTrials:       3,
 		Concurrency:     20,
 		OpenAIModel:     openai.ChatModelGPT4oMini,
-		TokenLimit:      1000,
 		RefinementRatio: 0.5,
 		OpenAIKey:       "test-key",
 		Encoding:        "o200k_base",

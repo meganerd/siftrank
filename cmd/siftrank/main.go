@@ -125,9 +125,6 @@ func run(cmd *cobra.Command, args []string) error {
 		userPrompt = string(content)
 	}
 
-	// Calculate token limit threshold (95% of max)
-	tokenLimitThreshold := int(0.95 * float64(batchTokens))
-
 	// Create config
 	config := &siftrank.Config{
 		InitialPrompt:   userPrompt,
@@ -135,7 +132,6 @@ func run(cmd *cobra.Command, args []string) error {
 		NumTrials:       maxTrials,
 		Concurrency:     concurrency,
 		OpenAIModel:     oaiModel,
-		TokenLimit:      tokenLimitThreshold,
 		RefinementRatio: refinementRatio,
 		OpenAIKey:       os.Getenv("OPENAI_API_KEY"),
 		OpenAIAPIURL:    oaiURL,
