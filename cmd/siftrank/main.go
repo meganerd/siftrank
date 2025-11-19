@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -10,114 +9,183 @@ import (
 
 	"github.com/noperator/siftrank/pkg/siftrank"
 	"github.com/openai/openai-go"
+	"github.com/spf13/cobra"
 )
 
-func main() {
-	inputFile := flag.String("f", "", "Input file")
-	forceJSON := flag.Bool("json", false, "Force JSON parsing regardless of file extension")
-	inputTemplate := flag.String("template", "{{.Data}}", "Template for each object in the input file (prefix with @ to use a file)")
-	batchSize := flag.Int("s", 10, "Number of items per batch")
-	numTrials := flag.Int("r", 50, "Number of trials")
-	concurrency := flag.Int("c", 20, "Max concurrent LLM calls across all trials")
-	batchTokens := flag.Int("t", 128000, "Max tokens per batch")
-	initialPrompt := flag.String("p", "", "Initial prompt (prefix with @ to use a file)")
-	outputFile := flag.String("o", "", "JSON output file")
+var (
+	// Input/Output
+	inputFile  string
+	forceJSON  bool
+	outputFile string
 
-	oaiModel := flag.String("openai-model", openai.ChatModelGPT4oMini, "OpenAI model name")
-	oaiURL := flag.String("openai-url", "", "OpenAI API base URL (e.g., for OpenAI-compatible API like vLLM)")
-	encoding := flag.String("encoding", "o200k_base", "Tokenizer encoding")
+	// Prompt/Template
+	initialPrompt string
+	inputTemplate string
 
-	dryRun := flag.Bool("dry-run", false, "Enable dry run mode (log API calls without making them)")
-	refinementRatio := flag.Float64("ratio", 0.5, "Refinement ratio as a decimal (e.g., 0.5 for 50%)")
-	debug := flag.Bool("debug", false, "Enable debug logging")
+	// Algorithm params
+	batchSize       int
+	maxTrials       int
+	concurrency     int
+	batchTokens     int
+	refinementRatio float64
 
-	noConverge := flag.Bool("no-converge", false, "Disable early stopping based on convergence")
-	elbowTolerance := flag.Float64("elbow-tolerance", 0.05, "Elbow position tolerance (0.05 = 5%)")
-	stableTrials := flag.Int("stable-trials", 5, "Stable trials required for convergence")
-	minTrials := flag.Int("min-trials", 5, "Minimum trials before checking convergence")
+	// Model params
+	oaiModel string
+	oaiURL   string
+	encoding string
 
-	flag.Parse()
+	// Convergence params
+	noConverge     bool
+	elbowTolerance float64
+	stableTrials   int
+	minTrials      int
 
-	// Set up structured logging with level based on debug flag
+	// Execution params
+	dryRun bool
+	debug  bool
+)
+
+var rootCmd = &cobra.Command{
+	Use:   "siftrank",
+	Short: "Use LLMs for document ranking via the SiftRank algorithm",
+	Long: `siftrank uses the SiftRank algorithm to rank documents using large language models.
+
+SiftRank employs multiple randomized trials with pairwise comparisons to create
+stable, reliable rankings even with non-deterministic LLM outputs.
+
+Examples:
+  # Rank sentences by relevance to "time"
+  siftrank -f sentences.txt -p "Rank by relevance to time"
+
+  # Rank JSON objects using a template
+  siftrank -f data.json --template "{{.title}}: {{.description}}"
+
+  # Use more trials for higher confidence
+  siftrank -f items.txt -p "Best to worst" --max-trials 100`,
+	RunE: run,
+}
+
+func init() {
+	// Input/Output flags
+	rootCmd.Flags().StringVarP(&inputFile, "file", "f", "", "input file (required)")
+	rootCmd.Flags().BoolVar(&forceJSON, "json", false, "force JSON parsing regardless of file extension")
+	rootCmd.Flags().StringVarP(&outputFile, "output", "o", "", "JSON output file")
+	rootCmd.MarkFlagRequired("file")
+
+	// Prompt/Template flags
+	rootCmd.Flags().StringVarP(&initialPrompt, "prompt", "p", "", "initial prompt (prefix with @ to use a file)")
+	rootCmd.Flags().StringVar(&inputTemplate, "template", "{{.Data}}", "template for each object (prefix with @ to use a file)")
+
+	// Algorithm parameter flags
+	rootCmd.Flags().IntVarP(&batchSize, "batch-size", "b", 10, "number of items per batch")
+	rootCmd.Flags().IntVar(&maxTrials, "max-trials", 50, "maximum number of ranking trials")
+	rootCmd.Flags().IntVarP(&concurrency, "concurrency", "c", 50, "max concurrent LLM calls across all trials")
+	rootCmd.Flags().IntVar(&batchTokens, "tokens", 128000, "max tokens per batch")
+	rootCmd.Flags().Float64Var(&refinementRatio, "ratio", 0.5, "refinement ratio (0.0-1.0, e.g. 0.5 = top 50%)")
+
+	// Model parameter flags
+	rootCmd.Flags().StringVarP(&oaiModel, "model", "m", openai.ChatModelGPT4oMini, "OpenAI model name")
+	rootCmd.Flags().StringVarP(&oaiURL, "base-url", "u", "", "OpenAI API base URL (for compatible APIs like vLLM)")
+	rootCmd.Flags().StringVar(&encoding, "encoding", "o200k_base", "tokenizer encoding")
+
+	// Convergence parameter flags
+	rootCmd.Flags().BoolVar(&noConverge, "no-converge", false, "disable early stopping based on convergence")
+	rootCmd.Flags().Float64Var(&elbowTolerance, "elbow-tolerance", 0.05, "elbow position tolerance (0.05 = 5%)")
+	rootCmd.Flags().IntVar(&stableTrials, "stable-trials", 5, "stable trials required for convergence")
+	rootCmd.Flags().IntVar(&minTrials, "min-trials", 5, "minimum trials before checking convergence")
+
+	// Execution flags
+	rootCmd.Flags().BoolVar(&dryRun, "dry-run", false, "log API calls without making them")
+	rootCmd.Flags().BoolVarP(&debug, "debug", "d", false, "enable debug logging")
+}
+
+func run(cmd *cobra.Command, args []string) error {
+	// Set up logging
 	logLevel := slog.LevelInfo
-	if *debug {
+	if debug {
 		logLevel = slog.LevelDebug
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: logLevel,
 	})).With("component", "siftrank-cli")
 
-	// This "threshold" is a way to add some padding to our estimation of
-	// average token usage per batch. We're effectively leaving 5% of
-	// wiggle room.
-	var tokenLimitThreshold = int(0.95 * float64(*batchTokens))
-
-	if *inputFile == "" {
-		logger.Error("Usage: raink -f <input_file> [-s <batch_size>] [-r <num_trials>] [-p <initial_prompt>] [-t <batch_tokens>] [-openai-model <model_name>] [-openai-url <base_url>] [-ratio <refinement_ratio>]")
-		return
+	// Validate refinement ratio
+	if refinementRatio < 0 || refinementRatio >= 1 {
+		return fmt.Errorf("refinement ratio must be >= 0 and < 1")
 	}
 
-	if *refinementRatio < 0 || *refinementRatio >= 1 {
-		fmt.Println("refinement ratio must be >= 0 and < 1")
-		os.Exit(1)
-	}
-
-	userPrompt := *initialPrompt
+	// Load prompt from file if needed
+	userPrompt := initialPrompt
 	if strings.HasPrefix(userPrompt, "@") {
 		filePath := strings.TrimPrefix(userPrompt, "@")
 		content, err := os.ReadFile(filePath)
 		if err != nil {
-			logger.Error("could not read initial prompt file", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("could not read initial prompt file: %w", err)
 		}
 		userPrompt = string(content)
 	}
 
+	// Calculate token limit threshold (95% of max)
+	tokenLimitThreshold := int(0.95 * float64(batchTokens))
+
+	// Create config
 	config := &siftrank.Config{
 		InitialPrompt:   userPrompt,
-		BatchSize:       *batchSize,
-		NumTrials:       *numTrials,
-		Concurrency:     *concurrency,
-		OpenAIModel:     *oaiModel,
+		BatchSize:       batchSize,
+		NumTrials:       maxTrials,
+		Concurrency:     concurrency,
+		OpenAIModel:     oaiModel,
 		TokenLimit:      tokenLimitThreshold,
-		RefinementRatio: *refinementRatio,
+		RefinementRatio: refinementRatio,
 		OpenAIKey:       os.Getenv("OPENAI_API_KEY"),
-		OpenAIAPIURL:    *oaiURL,
-		Encoding:        *encoding,
-		BatchTokens:     *batchTokens,
-		DryRun:          *dryRun,
+		OpenAIAPIURL:    oaiURL,
+		Encoding:        encoding,
+		BatchTokens:     batchTokens,
+		DryRun:          dryRun,
 		LogLevel:        logLevel,
 
-		EnableConvergence: !*noConverge,
-		ElbowTolerance:    *elbowTolerance,
-		StableTrials:      *stableTrials,
-		MinTrials:         *minTrials,
+		EnableConvergence: !noConverge,
+		ElbowTolerance:    elbowTolerance,
+		StableTrials:      stableTrials,
+		MinTrials:         minTrials,
 	}
 
+	// Create ranker
 	ranker, err := siftrank.NewRanker(config)
 	if err != nil {
-		logger.Error("failed to create ranker", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to create ranker: %w", err)
 	}
 
-	finalResults, err := ranker.RankFromFile(*inputFile, *inputTemplate, *forceJSON)
+	// Rank documents
+	finalResults, err := ranker.RankFromFile(inputFile, inputTemplate, forceJSON)
 	if err != nil {
-		logger.Error("failed to rank from file", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to rank from file: %w", err)
 	}
 
+	// Marshal results to JSON
 	jsonResults, err := json.MarshalIndent(finalResults, "", "  ")
 	if err != nil {
-		logger.Error("could not marshal results to JSON", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("could not marshal results to JSON: %w", err)
 	}
 
+	// Print results to stdout (unless dry run)
 	if !config.DryRun {
 		fmt.Println(string(jsonResults))
 	}
 
-	if *outputFile != "" {
-		os.WriteFile(*outputFile, jsonResults, 0644)
-		logger.Info("results written to file", "file", *outputFile)
+	// Write to output file if specified
+	if outputFile != "" {
+		if err := os.WriteFile(outputFile, jsonResults, 0644); err != nil {
+			return fmt.Errorf("failed to write output file: %w", err)
+		}
+		logger.Info("results written to file", "file", outputFile)
+	}
+
+	return nil
+}
+
+func main() {
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
 	}
 }
