@@ -1030,7 +1030,6 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 			"round", r.round,
 			"trial", result.trialNumber,
 			"batch", result.batchNumber,
-			"total_batches", r.numBatches,
 			"num_calls", result.numCalls,
 			"input_tokens", result.usage.InputTokens,
 			"output_tokens", result.usage.OutputTokens)
@@ -1767,6 +1766,7 @@ func (r *Ranker) callOpenAI(ctx context.Context, prompt string, trialNum int, ba
 				"round", r.round,
 				"trial", trialNum,
 				"batch", batchNum,
+				"call", numAPICalls,
 				"input_tokens", callUsage.InputTokens,
 				"output_tokens", callUsage.OutputTokens)
 
