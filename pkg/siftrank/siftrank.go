@@ -138,6 +138,18 @@ type docStats struct {
 	reasoningSnippets []string // Collected reasoning from all batches/trials
 }
 
+// Usage tracks token consumption for cost analysis
+type Usage struct {
+	InputTokens  int
+	OutputTokens int
+}
+
+// Add method to accumulate usage
+func (u *Usage) Add(other Usage) {
+	u.InputTokens += other.InputTokens
+	u.OutputTokens += other.OutputTokens
+}
+
 type Ranker struct {
 	cfg              *Config
 	encoding         *tiktoken.Tiktoken
@@ -153,6 +165,13 @@ type Ranker struct {
 	originalDocCount int                           // Track original dataset size for exposure calculation
 	comparedAgainst  map[string]map[string]bool    // Track which docs each was compared against (across ALL rounds/trials)
 	allDocStats      map[string]*docStats          // Track all documents across rounds (for reasoning collection)
+
+	// Token and call tracking (accumulate across all rounds)
+	totalUsage   Usage
+	totalCalls   int
+	totalBatches int
+	totalTrials  int
+	totalRounds  int
 }
 
 func NewRanker(config *Config) (*Ranker, error) {
@@ -516,6 +535,15 @@ func (r *Ranker) RankFromFile(filePath string, templateData string, forceJSON bo
 		}
 	}
 
+	// Log final totals
+	r.cfg.Logger.Info("Ranking completed",
+		"num_rounds", r.totalRounds,
+		"num_trials", r.totalTrials,
+		"num_batches", r.totalBatches,
+		"num_calls", r.totalCalls,
+		"input_tokens", r.totalUsage.InputTokens,
+		"output_tokens", r.totalUsage.OutputTokens)
+
 	return results, nil
 }
 
@@ -826,6 +854,8 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 
 	type batchResult struct {
 		rankedDocs  []rankedDocument
+		usage       Usage // Tokens for this batch (sum of all calls/retries)
+		numCalls    int   // Number of LLM calls made for this batch
 		err         error
 		trialNumber int
 		batchNumber int
@@ -925,7 +955,7 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 				r.semaphore <- struct{}{}
 
 				// Process batch
-				rankedBatch, err := r.rankDocs(ctx, work.batch, work.trialNum, work.batchNum)
+				rankedBatch, numCalls, usage, err := r.rankDocs(ctx, work.batch, work.trialNum, work.batchNum)
 
 				// Release semaphore
 				<-r.semaphore
@@ -933,6 +963,8 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 				// Send result
 				resultsChan <- batchResult{
 					rankedDocs:  rankedBatch,
+					usage:       usage,
+					numCalls:    numCalls,
 					err:         err,
 					trialNumber: work.trialNum,
 					batchNumber: work.batchNum,
@@ -947,8 +979,17 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 		close(resultsChan)
 	}()
 
-	// Track trial completion
-	completedBatches := make(map[int]int) // trialNum -> count of completed batches
+	// Track trial completion and stats
+	completedBatches := make(map[int]int)       // trialNum -> count of completed batches
+	completedTrials := make(map[int]bool)       // trialNum -> true if all batches completed
+
+	// Track per-trial stats
+	type trialStats struct {
+		numBatches int
+		numCalls   int
+		usage      Usage
+	}
+	trialStatsMap := make(map[int]*trialStats) // trial number -> stats
 
 	// Collect results
 	for result := range resultsChan {
@@ -984,12 +1025,39 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 		}
 		r.mu.Unlock()
 
+		// Log batch completion at debug level
+		r.cfg.Logger.Debug("Batch completed",
+			"round", r.round,
+			"trial", result.trialNumber,
+			"batch", result.batchNumber,
+			"num_calls", result.numCalls,
+			"input_tokens", result.usage.InputTokens,
+			"output_tokens", result.usage.OutputTokens)
+
+		// Track stats per trial
+		if trialStatsMap[result.trialNumber] == nil {
+			trialStatsMap[result.trialNumber] = &trialStats{}
+		}
+		stats := trialStatsMap[result.trialNumber]
+		stats.numBatches++
+		stats.numCalls += result.numCalls
+		stats.usage.Add(result.usage)
+
 		// Track trial completion
 		completedBatches[result.trialNumber]++
 
 		// Check if this trial just completed
 		if completedBatches[result.trialNumber] == r.numBatches {
-			r.cfg.Logger.Info("Trial completed", "round", r.round, "trial", result.trialNumber)
+			// Mark this trial as fully completed
+			completedTrials[result.trialNumber] = true
+
+			r.cfg.Logger.Info("Trial completed",
+				"round", r.round,
+				"trial", result.trialNumber,
+				"num_batches", stats.numBatches,
+				"num_calls", stats.numCalls,
+				"input_tokens", stats.usage.InputTokens,
+				"output_tokens", stats.usage.OutputTokens)
 
 			// Check for convergence
 			if r.hasConverged(scores, result.trialNumber) {
@@ -998,6 +1066,35 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 			}
 		}
 	}
+
+	// Accumulate round totals from all trials
+	var roundUsage Usage
+	var roundCalls int
+	var roundBatches int
+	completedTrialsCount := len(completedTrials) // Only trials that actually completed all batches
+
+	for _, stats := range trialStatsMap {
+		roundUsage.Add(stats.usage)
+		roundCalls += stats.numCalls
+		roundBatches += stats.numBatches
+	}
+
+	r.cfg.Logger.Info("Round completed",
+		"round", r.round,
+		"num_trials", completedTrialsCount,
+		"num_batches", roundBatches,
+		"num_calls", roundCalls,
+		"input_tokens", roundUsage.InputTokens,
+		"output_tokens", roundUsage.OutputTokens)
+
+	// Accumulate into ranker totals
+	r.mu.Lock()
+	r.totalUsage.Add(roundUsage)
+	r.totalCalls += roundCalls
+	r.totalBatches += roundBatches
+	r.totalTrials += completedTrialsCount
+	r.totalRounds++ // Increment on each round
+	r.mu.Unlock()
 
 	// Calculate average scores
 	finalScores := make(map[string]float64)
@@ -1396,7 +1493,7 @@ func (r *Ranker) estimateTokens(group []document, includePrompt bool) int {
 	return len(r.encoding.Encode(text, nil, nil))
 }
 
-func (r *Ranker) rankDocs(ctx context.Context, group []document, trialNumber int, batchNumber int) ([]rankedDocument, error) {
+func (r *Ranker) rankDocs(ctx context.Context, group []document, trialNumber int, batchNumber int) ([]rankedDocument, int, Usage, error) {
 	if r.cfg.DryRun {
 		r.cfg.Logger.Debug("Dry run API call")
 		// Simulate a ranked response for dry run
@@ -1407,14 +1504,17 @@ func (r *Ranker) rankDocs(ctx context.Context, group []document, trialNumber int
 				Score:    float64(i + 1), // Simulate scores based on position
 			})
 		}
-		return rankedDocs, nil
+		return rankedDocs, 0, Usage{}, nil // Zero calls, zero tokens in dry-run
 	}
+
+	var totalUsage Usage
+	var numCalls int
 
 	maxRetries := 10
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		// Check if context cancelled
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, numCalls, totalUsage, ctx.Err()
 		}
 
 		// Try to create memorable ID mappings for each attempt
@@ -1457,10 +1557,17 @@ func (r *Ranker) rankDocs(ctx context.Context, group []document, trialNumber int
 		}
 
 		var rankedResponse rankedDocumentResponse
-		rankedResponse, err = r.callOpenAI(ctx, prompt, trialNumber, batchNumber, inputIDs)
+		var apiCalls int
+		var callUsage Usage
+		rankedResponse, apiCalls, callUsage, err = r.callOpenAI(ctx, prompt, trialNumber, batchNumber, inputIDs)
+
+		// Accumulate API calls and usage (even if there was an error, partial calls may have been made)
+		numCalls += apiCalls
+		totalUsage.Add(callUsage)
+
 		if err != nil {
 			if attempt == maxRetries-1 {
-				return nil, err
+				return nil, numCalls, totalUsage, err
 			}
 			r.logFromApiCall(trialNumber, batchNumber, "API call failed, retrying with new memorable IDs (attempt %d): %v", attempt+1, err)
 			continue
@@ -1486,7 +1593,7 @@ func (r *Ranker) rankDocs(ctx context.Context, group []document, trialNumber int
 				missingIDs = append(missingIDs, id)
 			}
 			if attempt == maxRetries-1 {
-				return nil, fmt.Errorf("missing IDs after %d attempts: %v", maxRetries, missingIDs)
+				return nil, numCalls, totalUsage, fmt.Errorf("missing IDs after %d attempts: %v", maxRetries, missingIDs)
 			}
 			r.logFromApiCall(trialNumber, batchNumber, "Missing IDs, retrying with new memorable IDs (attempt %d): %v", attempt+1, missingIDs)
 			continue
@@ -1517,10 +1624,10 @@ func (r *Ranker) rankDocs(ctx context.Context, group []document, trialNumber int
 			r.mu.Unlock()
 		}
 
-		return rankedDocs, nil
+		return rankedDocs, numCalls, totalUsage, nil
 	}
 
-	return nil, fmt.Errorf("failed after %d attempts", maxRetries)
+	return nil, numCalls, totalUsage, fmt.Errorf("failed after %d attempts", maxRetries)
 }
 
 type customTransport struct {
@@ -1586,7 +1693,7 @@ func validateIDs(rankedResponse *rankedDocumentResponse, inputIDs map[string]boo
 	}
 }
 
-func (r *Ranker) callOpenAI(ctx context.Context, prompt string, trialNum int, batchNum int, inputIDs map[string]bool) (rankedDocumentResponse, error) {
+func (r *Ranker) callOpenAI(ctx context.Context, prompt string, trialNum int, batchNum int, inputIDs map[string]bool) (rankedDocumentResponse, int, Usage, error) {
 
 	customTransport := &customTransport{Transport: http.DefaultTransport}
 	customClient := &http.Client{Transport: customTransport}
@@ -1616,10 +1723,13 @@ func (r *Ranker) callOpenAI(ctx context.Context, prompt string, trialNum int, ba
 	}
 
 	var rankedResponse rankedDocumentResponse
+	var totalUsage Usage // Accumulate across retries in this function
+	var numAPICalls int  // Track actual API calls made
+
 	for {
 		// Check if context cancelled before API call
 		if ctx.Err() != nil {
-			return rankedDocumentResponse{}, ctx.Err()
+			return rankedDocumentResponse{}, numAPICalls, totalUsage, ctx.Err()
 		}
 
 		// Create timeout context that respects parent cancellation
@@ -1641,6 +1751,24 @@ func (r *Ranker) callOpenAI(ctx context.Context, prompt string, trialNum int, ba
 			Model: r.cfg.OpenAIModel,
 		})
 		if err == nil {
+			// Increment API call counter
+			numAPICalls++
+
+			// Extract usage from this call
+			callUsage := Usage{
+				InputTokens:  int(completion.Usage.PromptTokens),
+				OutputTokens: int(completion.Usage.CompletionTokens),
+			}
+			totalUsage.Add(callUsage)
+
+			// Log successful API call (before validation)
+			r.cfg.Logger.Debug("LLM call completed",
+				"round", r.round,
+				"trial", trialNum,
+				"batch", batchNum,
+				"call", numAPICalls,
+				"input_tokens", callUsage.InputTokens,
+				"output_tokens", callUsage.OutputTokens)
 
 			conversationHistory = append(conversationHistory,
 				openai.AssistantMessage(completion.Choices[0].Message.Content),
@@ -1668,12 +1796,12 @@ func (r *Ranker) callOpenAI(ctx context.Context, prompt string, trialNum int, ba
 				continue
 			}
 
-			return rankedResponse, nil
+			return rankedResponse, numAPICalls, totalUsage, nil
 		}
 
 		// Check if cancellation caused the error
 		if ctx.Err() != nil {
-			return rankedDocumentResponse{}, ctx.Err()
+			return rankedDocumentResponse{}, numAPICalls, totalUsage, ctx.Err()
 		}
 
 		if err == context.DeadlineExceeded {
@@ -1716,7 +1844,7 @@ func (r *Ranker) callOpenAI(ctx context.Context, prompt string, trialNum int, ba
 				backoff *= 2
 			}
 		} else {
-			return rankedDocumentResponse{}, fmt.Errorf("trial %*d/%d, batch %*d/%d: unexpected error: %w", len(strconv.Itoa(r.cfg.NumTrials)), trialNum, r.cfg.NumTrials, len(strconv.Itoa(r.numBatches)), batchNum, r.numBatches, err)
+			return rankedDocumentResponse{}, numAPICalls, totalUsage, fmt.Errorf("trial %*d/%d, batch %*d/%d: unexpected error: %w", len(strconv.Itoa(r.cfg.NumTrials)), trialNum, r.cfg.NumTrials, len(strconv.Itoa(r.numBatches)), batchNum, r.numBatches, err)
 		}
 	}
 }
