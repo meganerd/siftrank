@@ -84,6 +84,7 @@ type Config struct {
 	Encoding        string           `json:"encoding"`
 	BatchTokens     int              `json:"batch_tokens"`
 	DryRun          bool             `json:"-"`
+	TracePath       string           `json:"-"`
 	Relevance       bool             `json:"relevance"`
 	Effort          string           `json:"effort"`
 	Logger          *slog.Logger     `json:"-"`
@@ -166,6 +167,7 @@ type Ranker struct {
 	originalDocCount int                           // Track original dataset size for exposure calculation
 	comparedAgainst  map[string]map[string]bool    // Track which docs each was compared against (across ALL rounds/trials)
 	allDocStats      map[string]*docStats          // Track all documents across rounds (for relevance collection)
+	traceFile        *os.File                      // Keep file open across all rounds
 
 	// Token and call tracking (accumulate across all rounds)
 	totalUsage   Usage
@@ -307,6 +309,24 @@ type RankedDocument struct {
 	Relevance *RelevanceProsCons  `json:"relevance,omitempty"` // Only if relevance enabled
 }
 
+type traceDocument struct {
+	ID    string  `json:"id"`
+	Value string  `json:"value"`
+	Score float64 `json:"score"`
+}
+
+type traceLine struct {
+	Round              int              `json:"round"`
+	Trial              int              `json:"trial"`
+	TrialsCompleted    int              `json:"trials_completed"`
+	TrialsRemaining    int              `json:"trials_remaining"`
+	TotalInputTokens   int              `json:"total_input_tokens"`
+	TotalOutputTokens  int              `json:"total_output_tokens"`
+	ElbowPosition      *int             `json:"elbow_position,omitempty"`      // nil if not detected
+	StableTrialsCount  int              `json:"stable_trials_count,omitempty"` // only if convergence enabled
+	Rankings           []traceDocument  `json:"rankings"`
+}
+
 func generateSchema[T any]() interface{} {
 	reflector := jsonschema.Reflector{
 		AllowAdditionalProperties: false,
@@ -426,6 +446,20 @@ func (r *Ranker) RankFromFile(filePath string, templateData string, forceJSON bo
 
 	if err := r.adjustBatchSize(documents); err != nil {
 		return nil, err
+	}
+
+	// Open trace file if specified
+	if r.cfg.TracePath != "" {
+		traceFile, err := os.Create(r.cfg.TracePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create trace file: %w", err)
+		}
+		r.traceFile = traceFile
+		defer func() {
+			if err := r.traceFile.Close(); err != nil {
+				r.cfg.Logger.Warn("Failed to close trace file", "error", err)
+			}
+		}()
 	}
 
 	// Initialize global comparison tracking for exposure calculation
@@ -836,6 +870,88 @@ Example: {"pros": "Strong connection to X. References Y explicitly.", "cons": "L
 	return &result, nil
 }
 
+func (r *Ranker) writeTraceLine(trialNum int, trialsCompleted int, scores map[string][]float64, documents []document) error {
+	if r.traceFile == nil {
+		return nil // Tracing not enabled
+	}
+
+	// Calculate current rankings from accumulated scores
+	var rankings []traceDocument
+	for id, scoreList := range scores {
+		var sum float64
+		for _, score := range scoreList {
+			sum += score
+		}
+		avgScore := sum / float64(len(scoreList))
+
+		// Find the document value
+		var value string
+		for _, doc := range documents {
+			if doc.ID == id {
+				value = doc.Value
+				break
+			}
+		}
+
+		rankings = append(rankings, traceDocument{
+			ID:    id,
+			Value: value,
+			Score: avgScore,
+		})
+	}
+
+	// Sort by score (lower is better)
+	sort.Slice(rankings, func(i, j int) bool {
+		return rankings[i].Score < rankings[j].Score
+	})
+
+	// Build trace line
+	trace := traceLine{
+		Round:             r.round,
+		Trial:             trialNum,
+		TrialsCompleted:   trialsCompleted,
+		TrialsRemaining:   r.cfg.NumTrials - trialsCompleted,
+		TotalInputTokens:  r.totalUsage.InputTokens,
+		TotalOutputTokens: r.totalUsage.OutputTokens,
+		Rankings:          rankings,
+	}
+
+	// Add convergence info if enabled
+	if r.cfg.EnableConvergence {
+		r.mu.Lock()
+		if len(r.elbowPositions) > 0 {
+			lastElbow := r.elbowPositions[len(r.elbowPositions)-1]
+			if lastElbow >= 0 {
+				trace.ElbowPosition = &lastElbow
+			}
+
+			// Calculate stability count using shared logic
+			stableCount, _ := r.countStableElbows(len(rankings))
+			if stableCount > 0 {
+				trace.StableTrialsCount = stableCount
+			}
+		}
+		r.mu.Unlock()
+	}
+
+	// Write JSON line
+	data, err := json.Marshal(trace)
+	if err != nil {
+		return fmt.Errorf("failed to marshal trace line: %w", err)
+	}
+
+	if _, err := r.traceFile.Write(append(data, '\n')); err != nil {
+		return fmt.Errorf("failed to write trace line: %w", err)
+	}
+
+	// Flush to disk immediately
+	if err := r.traceFile.Sync(); err != nil {
+		return fmt.Errorf("failed to sync trace file: %w", err)
+	}
+
+	return nil
+}
+
 func (r *Ranker) logFromApiCall(trialNum, batchNum int, message string, args ...interface{}) {
 	formattedMessage := fmt.Sprintf(message, args...)
 	r.cfg.Logger.Debug(formattedMessage, "round", r.round, "trial", trialNum, "total_trials", r.cfg.NumTrials, "batch", batchNum, "total_batches", r.numBatches)
@@ -1057,17 +1173,33 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 		if completedBatches[result.trialNumber] == r.numBatches {
 			// Mark this trial as fully completed
 			completedTrials[result.trialNumber] = true
+			completedTrialsCount := len(completedTrials)
 
 			r.cfg.Logger.Info("Trial completed",
 				"round", r.round,
-				"trial", result.trialNumber,
+				"trial", completedTrialsCount,
 				"num_batches", stats.numBatches,
 				"num_calls", stats.numCalls,
 				"input_tokens", stats.usage.InputTokens,
 				"output_tokens", stats.usage.OutputTokens)
 
-			// Check for convergence
-			if r.hasConverged(scores, result.trialNumber) {
+			// Update running totals immediately after trial completion
+			r.mu.Lock()
+			r.totalUsage.Add(stats.usage)
+			r.totalCalls += stats.numCalls
+			r.totalBatches += stats.numBatches
+			r.mu.Unlock()
+
+			// Check for convergence (this adds the current trial's elbow to the array)
+			converged := r.hasConverged(scores, result.trialNumber)
+
+			// Write trace line (after convergence check so current elbow is included)
+			if err := r.writeTraceLine(completedTrialsCount, completedTrialsCount, scores, documents); err != nil {
+				r.cfg.Logger.Error("Failed to write trace line", "error", err)
+			}
+
+			// Signal workers to stop if converged
+			if converged {
 				// No need to log here - hasConverged() already logged if it's the first detection
 				cancel() // Signal all workers to stop processing new work
 			}
@@ -1094,11 +1226,8 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 		"input_tokens", roundUsage.InputTokens,
 		"output_tokens", roundUsage.OutputTokens)
 
-	// Accumulate into ranker totals
+	// Update round-level totals (usage/calls/batches already updated per-trial)
 	r.mu.Lock()
-	r.totalUsage.Add(roundUsage)
-	r.totalCalls += roundCalls
-	r.totalBatches += roundBatches
 	r.totalTrials += completedTrialsCount
 	r.totalRounds++ // Increment on each round
 	r.mu.Unlock()
@@ -1199,18 +1328,14 @@ func findElbow(rankedDocs []RankedDocument) int {
 	return elbowIdx
 }
 
-// isElbowStable checks if recent elbow positions are within tolerance
-// Returns (isStable, actualTolerance)
-func (r *Ranker) isElbowStable(numDocuments int) (bool, int) {
+// countStableElbows returns how many consecutive recent elbow positions are within tolerance
+// Returns the count (1 to StableTrials) and the tolerance used
+func (r *Ranker) countStableElbows(numDocuments int) (int, int) {
 	n := len(r.elbowPositions)
 
-	// Need at least StableTrials to check
-	if n < r.cfg.StableTrials {
-		return false, 0
+	if n < 2 {
+		return 0, 0
 	}
-
-	// Get the most recent positions
-	recentPositions := r.elbowPositions[n-r.cfg.StableTrials:]
 
 	// Calculate tolerance in absolute terms (number of positions)
 	tolerance := int(r.cfg.ElbowTolerance * float64(numDocuments))
@@ -1218,21 +1343,35 @@ func (r *Ranker) isElbowStable(numDocuments int) (bool, int) {
 		tolerance = 1 // At minimum, allow 1 position variance
 	}
 
-	// Find min and max of recent positions
-	minPos := recentPositions[0]
-	maxPos := recentPositions[0]
-	for _, pos := range recentPositions[1:] {
-		if pos < minPos {
-			minPos = pos
+	// Check windows of increasing size to find largest that fits within tolerance
+	stableCount := 1 // Current position always counts
+	for windowSize := 2; windowSize <= r.cfg.StableTrials && windowSize <= n; windowSize++ {
+		// Check if last 'windowSize' positions are all within tolerance
+		start := n - windowSize
+		minPos := r.elbowPositions[start]
+		maxPos := r.elbowPositions[start]
+		for i := start + 1; i < n; i++ {
+			if r.elbowPositions[i] < minPos {
+				minPos = r.elbowPositions[i]
+			}
+			if r.elbowPositions[i] > maxPos {
+				maxPos = r.elbowPositions[i]
+			}
 		}
-		if pos > maxPos {
-			maxPos = pos
+
+		if maxPos-minPos <= tolerance {
+			stableCount = windowSize
 		}
 	}
 
-	// Check if range is within tolerance
-	isStable := (maxPos - minPos) <= tolerance
-	return isStable, tolerance
+	return stableCount, tolerance
+}
+
+// isElbowStable checks if recent elbow positions are within tolerance
+// Returns (isStable, actualTolerance)
+func (r *Ranker) isElbowStable(numDocuments int) (bool, int) {
+	stableCount, tolerance := r.countStableElbows(numDocuments)
+	return stableCount >= r.cfg.StableTrials, tolerance
 }
 
 // isRankingStable checks if the full ranking order has stabilized
