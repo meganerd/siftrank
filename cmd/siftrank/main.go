@@ -47,6 +47,7 @@ var (
 	relevance bool
 	traceFile string
 	observe   bool
+	minimap   bool
 )
 
 var rootCmd = &cobra.Command{
@@ -105,6 +106,7 @@ func init() {
 	rootCmd.Flags().BoolVarP(&relevance, "relevance", "r", false, "post-process each item by providing relevance justification (skips round 1)")
 	rootCmd.Flags().StringVar(&traceFile, "trace", "", "trace file path for streaming trial execution state (JSON Lines format)")
 	rootCmd.Flags().BoolVar(&observe, "observe", false, "enable live terminal visualization")
+	rootCmd.Flags().BoolVar(&minimap, "minimap", false, "show minimap panel in observe mode (condensed overview)")
 }
 
 func run(cmd *cobra.Command, args []string) error {
@@ -151,6 +153,7 @@ func run(cmd *cobra.Command, args []string) error {
 		Effort:          effort,
 		LogLevel:        logLevel,
 		Observe:         observe,
+		MinimapEnabled:  minimap,
 
 		EnableConvergence: !noConverge,
 		ElbowTolerance:    elbowTolerance,
