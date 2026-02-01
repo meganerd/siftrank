@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/noperator/siftrank/pkg/siftrank"
 	"github.com/openai/openai-go"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 var (
@@ -40,32 +42,76 @@ var (
 	elbowTolerance float64
 	stableTrials   int
 	minTrials      int
+	elbowMethod    string
 
 	// Execution params
 	dryRun    bool
 	debug     bool
 	relevance bool
 	traceFile string
+	watch     bool
+	noMinimap bool
+	logFile   string
 )
+
+// setFlagGroup annotates flags with a group name for organized help output.
+func setFlagGroup(cmd *cobra.Command, group string, names ...string) {
+	for _, name := range names {
+		f := cmd.Flags().Lookup(name)
+		if f != nil {
+			if f.Annotations == nil {
+				f.Annotations = make(map[string][]string)
+			}
+			f.Annotations["group"] = []string{group}
+		}
+	}
+}
+
+// FlagsInGroup returns a FlagSet containing only flags that belong to the specified group.
+func FlagsInGroup(cmd *cobra.Command, group string) *pflag.FlagSet {
+	result := pflag.NewFlagSet("grouped", pflag.ContinueOnError)
+	cmd.Flags().VisitAll(func(f *pflag.Flag) {
+		if g, ok := f.Annotations["group"]; ok && len(g) > 0 && g[0] == group {
+			result.AddFlag(f)
+		}
+	})
+	return result
+}
+
+// FilterFlags returns a FlagSet containing only flags that don't belong to any group (plus help).
+func FilterFlags(cmd *cobra.Command) *pflag.FlagSet {
+	result := pflag.NewFlagSet("ungrouped", pflag.ContinueOnError)
+	cmd.Flags().VisitAll(func(f *pflag.Flag) {
+		if _, ok := f.Annotations["group"]; !ok {
+			result.AddFlag(f)
+		}
+	})
+	return result
+}
+
+const usageTemplate = `Usage:
+  {{.UseLine}}
+
+Options:
+{{FlagsInGroup . "options" | FlagUsages | trimTrailingWhitespaces}}
+
+Visualization:
+{{FlagsInGroup . "visualization" | FlagUsages | trimTrailingWhitespaces}}
+
+Debug:
+{{FlagsInGroup . "debug" | FlagUsages | trimTrailingWhitespaces}}
+
+Advanced:
+{{FlagsInGroup . "advanced" | FlagUsages | trimTrailingWhitespaces}}
+
+Flags:
+{{FilterFlags . | FlagUsages | trimTrailingWhitespaces}}
+`
 
 var rootCmd = &cobra.Command{
 	Use:   "siftrank",
 	Short: "Use LLMs for document ranking via the SiftRank algorithm",
-	Long: `siftrank uses the SiftRank algorithm to rank documents using large language models.
-
-SiftRank employs multiple randomized trials with pairwise comparisons to create
-stable, reliable rankings even with non-deterministic LLM outputs.
-
-Examples:
-  # Rank sentences by relevance to "time"
-  siftrank -f sentences.txt -p "Rank by relevance to time"
-
-  # Rank JSON objects using a template
-  siftrank -f data.json --template "{{.title}}: {{.description}}"
-
-  # Use more trials for higher confidence
-  siftrank -f items.txt -p "Best to worst" --max-trials 100`,
-	RunE: run,
+	RunE:  run,
 }
 
 func init() {
@@ -97,12 +143,32 @@ func init() {
 	rootCmd.Flags().Float64Var(&elbowTolerance, "elbow-tolerance", 0.05, "elbow position tolerance (0.05 = 5%)")
 	rootCmd.Flags().IntVar(&stableTrials, "stable-trials", 5, "stable trials required for convergence")
 	rootCmd.Flags().IntVar(&minTrials, "min-trials", 5, "minimum trials before checking convergence")
+	rootCmd.Flags().StringVar(&elbowMethod, "elbow-method", "curvature", "elbow detection method: curvature (default), perpendicular")
 
 	// Execution flags
 	rootCmd.Flags().BoolVar(&dryRun, "dry-run", false, "log API calls without making them")
 	rootCmd.Flags().BoolVarP(&debug, "debug", "d", false, "enable debug logging")
 	rootCmd.Flags().BoolVarP(&relevance, "relevance", "r", false, "post-process each item by providing relevance justification (skips round 1)")
 	rootCmd.Flags().StringVar(&traceFile, "trace", "", "trace file path for streaming trial execution state (JSON Lines format)")
+	rootCmd.Flags().BoolVar(&watch, "watch", false, "enable live terminal visualization (logs suppressed unless --log is specified)")
+	rootCmd.Flags().BoolVar(&noMinimap, "no-minimap", false, "disable minimap panel in watch mode")
+	rootCmd.Flags().StringVar(&logFile, "log", "", "write logs to file instead of stderr")
+
+	// Register template functions for flag grouping
+	cobra.AddTemplateFunc("FlagsInGroup", FlagsInGroup)
+	cobra.AddTemplateFunc("FilterFlags", FilterFlags)
+	cobra.AddTemplateFunc("FlagUsages", func(fs *pflag.FlagSet) string {
+		return fs.FlagUsages()
+	})
+
+	// Set custom usage template
+	rootCmd.SetUsageTemplate(usageTemplate)
+
+	// Organize flags into groups
+	setFlagGroup(rootCmd, "options", "file", "prompt", "output", "model", "relevance")
+	setFlagGroup(rootCmd, "visualization", "watch", "no-minimap")
+	setFlagGroup(rootCmd, "debug", "trace", "debug", "dry-run", "log")
+	setFlagGroup(rootCmd, "advanced", "template", "json", "base-url", "encoding", "effort", "tokens", "batch-size", "max-trials", "concurrency", "ratio", "no-converge", "elbow-tolerance", "stable-trials", "min-trials", "elbow-method")
 }
 
 func run(cmd *cobra.Command, args []string) error {
@@ -111,7 +177,23 @@ func run(cmd *cobra.Command, args []string) error {
 	if debug {
 		logLevel = slog.LevelDebug
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+
+	var logWriter *os.File
+	var logOutput io.Writer = os.Stderr
+	if logFile != "" {
+		var err error
+		logWriter, err = os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return fmt.Errorf("failed to open log file: %w", err)
+		}
+		defer logWriter.Close()
+		logOutput = logWriter
+	} else if watch {
+		// Suppress logs when --watch is used without --log
+		logOutput = io.Discard
+	}
+
+	logger := slog.New(slog.NewTextHandler(logOutput, &slog.HandlerOptions{
 		Level: logLevel,
 	})).With("component", "siftrank-cli")
 
@@ -147,12 +229,16 @@ func run(cmd *cobra.Command, args []string) error {
 		TracePath:       traceFile,
 		Relevance:       relevance,
 		Effort:          effort,
-		LogLevel:        logLevel,
+		LogLevel:  logLevel,
+		Logger:    logger,
+		Watch:     watch,
+		NoMinimap: noMinimap,
 
 		EnableConvergence: !noConverge,
 		ElbowTolerance:    elbowTolerance,
 		StableTrials:      stableTrials,
 		MinTrials:         minTrials,
+		ElbowMethod:       elbowMethod,
 	}
 
 	// Create ranker

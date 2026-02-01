@@ -14,14 +14,17 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"text/template"
 	"time"
 
+	"github.com/gdamore/tcell/v2"
 	"github.com/openai/openai-go"
 )
 
@@ -85,6 +88,7 @@ type Config struct {
 	ElbowTolerance    float64 `json:"elbow_tolerance"`
 	StableTrials      int     `json:"stable_trials"`
 	MinTrials         int     `json:"min_trials"`
+	ElbowMethod string `json:"elbow_method"` // "curvature" (default) or "perpendicular"
 
 	// LLM configuration
 	LLMProvider LLMProvider `json:"-"` // Optional: if nil, creates default OpenAI provider
@@ -95,6 +99,10 @@ type Config struct {
 	OpenAIAPIURL string           `json:"-"`
 	Encoding     string           `json:"encoding"`
 	Effort       string           `json:"effort"`
+
+	// Visualization
+	Watch     bool `json:"-"` // Enable live terminal visualization
+	NoMinimap bool `json:"-"` // Disable minimap panel (minimap shown by default)
 }
 
 func (c *Config) Validate() error {
@@ -131,6 +139,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("minimum trials must be at least 2")
 		}
 	}
+	if c.ElbowMethod != "" && c.ElbowMethod != "curvature" && c.ElbowMethod != "perpendicular" {
+		return fmt.Errorf("elbow method must be 'curvature' or 'perpendicular', got '%s'", c.ElbowMethod)
+	}
 	return nil
 }
 
@@ -157,6 +168,7 @@ type Ranker struct {
 	comparedAgainst  map[string]map[string]bool // Track which docs each was compared against (across ALL rounds/trials)
 	allDocStats      map[string]*docStats       // Track all documents across rounds (for relevance collection)
 	traceFile        *os.File                   // Keep file open across all rounds
+	screen           interface{}                // tcell.Screen for terminal visualization (interface{} to avoid import cycle)
 
 	// Token and call tracking (accumulate across all rounds)
 	totalUsage   Usage
@@ -437,6 +449,60 @@ func (r *Ranker) RankFromFile(filePath string, templateData string, forceJSON bo
 
 	if err := r.adjustBatchSize(documents); err != nil {
 		return nil, err
+	}
+
+	// Initialize terminal visualization if enabled
+	if r.cfg.Watch {
+		screen, err := tcell.NewScreen()
+		if err != nil {
+			r.cfg.Logger.Warn("Failed to create screen for visualization", "error", err)
+			r.cfg.Watch = false // Disable watch mode
+		} else {
+			if err := screen.Init(); err != nil {
+				r.cfg.Logger.Warn("Failed to initialize screen for visualization", "error", err)
+				r.cfg.Watch = false // Disable watch mode
+			} else {
+				r.screen = screen
+				defer func() {
+					if r.screen != nil {
+						if s, ok := r.screen.(tcell.Screen); ok {
+							s.Fini()
+						}
+					}
+				}()
+
+				// Setup signal and keyboard event handlers
+				sigChan := make(chan os.Signal, 1)
+				signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+				// Keyboard event handler
+				go func() {
+					for {
+						ev := screen.PollEvent()
+						switch ev := ev.(type) {
+						case *tcell.EventKey:
+							if ev.Key() == tcell.KeyCtrlC || ev.Key() == tcell.KeyEscape || ev.Rune() == 'q' {
+								if s, ok := r.screen.(tcell.Screen); ok {
+									s.Fini()
+								}
+								os.Exit(0)
+							}
+						case *tcell.EventResize:
+							screen.Sync()
+						}
+					}
+				}()
+
+				// Signal handler
+				go func() {
+					<-sigChan
+					if s, ok := r.screen.(tcell.Screen); ok {
+						s.Fini()
+					}
+					os.Exit(0)
+				}()
+			}
+		}
 	}
 
 	// Open trace file if specified
@@ -837,9 +903,10 @@ Example: {"pros": "Strong connection to X. References Y explicitly.", "cons": "L
 	return &result, opts.Usage, nil
 }
 
-func (r *Ranker) writeTraceLine(trialNum int, trialsCompleted int, scores map[string][]float64, documents []document) error {
-	if r.traceFile == nil {
-		return nil // Tracing not enabled
+func (r *Ranker) recordTrialState(trialNum int, trialsCompleted int, scores map[string][]float64, documents []document) error {
+	// Early exit if neither feature is enabled
+	if r.traceFile == nil && !r.cfg.Watch {
+		return nil
 	}
 
 	// Calculate current rankings from accumulated scores
@@ -901,22 +968,259 @@ func (r *Ranker) writeTraceLine(trialNum int, trialsCompleted int, scores map[st
 		r.mu.Unlock()
 	}
 
-	// Write JSON line
-	data, err := json.Marshal(trace)
-	if err != nil {
-		return fmt.Errorf("failed to marshal trace line: %w", err)
+	// File writing - only if trace enabled
+	if r.traceFile != nil {
+		data, err := json.Marshal(trace)
+		if err != nil {
+			return fmt.Errorf("failed to marshal trace line: %w", err)
+		}
+
+		if _, err := r.traceFile.Write(append(data, '\n')); err != nil {
+			return fmt.Errorf("failed to write trace line: %w", err)
+		}
+
+		// Flush to disk immediately
+		if err := r.traceFile.Sync(); err != nil {
+			return fmt.Errorf("failed to sync trace file: %w", err)
+		}
 	}
 
-	if _, err := r.traceFile.Write(append(data, '\n')); err != nil {
-		return fmt.Errorf("failed to write trace line: %w", err)
-	}
-
-	// Flush to disk immediately
-	if err := r.traceFile.Sync(); err != nil {
-		return fmt.Errorf("failed to sync trace file: %w", err)
+	// Visualization - only if watch enabled
+	if r.cfg.Watch && r.screen != nil {
+		r.renderVisualization(rankings, r.round, trialNum)
 	}
 
 	return nil
+}
+
+// writeString writes a string to the screen at the given position with the given style
+func (r *Ranker) writeString(screen tcell.Screen, x, y int, s string, style tcell.Style) {
+	for i, ch := range s {
+		screen.SetContent(x+i, y, ch, nil, style)
+	}
+}
+
+// renderVisualization routes to the appropriate rendering function based on configuration
+func (r *Ranker) renderVisualization(rankings []traceDocument, round, trial int) {
+	if r.screen == nil {
+		return
+	}
+
+	screen, ok := r.screen.(tcell.Screen)
+	if !ok {
+		return
+	}
+
+	// Route to appropriate rendering function
+	if r.cfg.NoMinimap {
+		r.renderFullWidth(screen, rankings, round, trial)
+	} else {
+		r.renderWithMinimap(screen, rankings, round, trial)
+	}
+}
+
+// renderFullWidth renders the visualization using the full terminal width
+func (r *Ranker) renderFullWidth(screen tcell.Screen, rankings []traceDocument, round, trial int) {
+	screen.Clear()
+	width, height := screen.Size()
+
+	// Render using full width
+	r.renderMainDisplay(screen, rankings, round, trial, 0, width, height)
+
+	screen.Show()
+}
+
+// renderWithMinimap renders a split-screen view with main display and minimap
+func (r *Ranker) renderWithMinimap(screen tcell.Screen, rankings []traceDocument, round, trial int) {
+	screen.Clear()
+	width, height := screen.Size()
+
+	// Check if terminal is too narrow for minimap
+	if width < 30 {
+		// Fall back to full-width if too narrow
+		r.renderMainDisplay(screen, rankings, round, trial, 0, width, height)
+		screen.Show()
+		return
+	}
+
+	// Calculate layout: 80% main, 20% minimap
+	mainWidth := int(float64(width) * 0.8)
+	minimapStart := mainWidth + 1
+	minimapWidth := width - minimapStart
+
+	// Draw main display (left side)
+	r.renderMainDisplay(screen, rankings, round, trial, 0, mainWidth, height)
+
+	// Draw vertical separator
+	separatorStyle := tcell.StyleDefault.Foreground(tcell.ColorGray)
+	for y := 0; y < height; y++ {
+		screen.SetContent(mainWidth, y, '│', nil, separatorStyle)
+	}
+
+	// Draw minimap (right side)
+	r.renderMinimap(screen, rankings, round, minimapStart, minimapWidth, height)
+
+	screen.Show()
+}
+
+// renderMinimap renders a condensed overview of all rankings
+func (r *Ranker) renderMinimap(screen tcell.Screen, rankings []traceDocument, round, startX, width, height int) {
+	if width < 5 {
+		return // Not enough space
+	}
+
+	// Header
+	header := fmt.Sprintf("Map:%d", len(rankings))
+	r.writeString(screen, startX, 0, header, tcell.StyleDefault.Bold(true))
+
+	// Available height for items (reserve header + margins)
+	displayHeight := height - 3
+	if displayHeight < 1 {
+		return
+	}
+
+	totalItems := len(rankings)
+	if totalItems == 0 {
+		return
+	}
+
+	// Calculate max score for normalization
+	maxScore := 0.0
+	if len(rankings) > 0 {
+		maxScore = rankings[len(rankings)-1].Score
+	}
+
+	// Determine compression ratio
+	itemsPerRow := 1.0
+	if totalItems > displayHeight {
+		itemsPerRow = float64(totalItems) / float64(displayHeight)
+	}
+
+	// Find elbow position in the rankings
+	elbowIndex := -1
+	r.mu.Lock()
+	if r.cfg.EnableConvergence && len(r.elbowPositions) > 0 {
+		elbowIndex = r.elbowPositions[len(r.elbowPositions)-1]
+	}
+	r.mu.Unlock()
+
+	// Render each row
+	for row := 0; row < displayHeight; row++ {
+		y := row + 3 // Align with main display (which starts data at row 3)
+		if y >= height {
+			break
+		}
+
+		// Calculate which items belong to this row
+		startIdx := int(float64(row) * itemsPerRow)
+		endIdx := int(float64(row+1) * itemsPerRow)
+		if endIdx > totalItems {
+			endIdx = totalItems
+		}
+		if startIdx >= totalItems {
+			break
+		}
+
+		// Calculate average score for this bucket
+		var sumScore float64
+		for i := startIdx; i < endIdx; i++ {
+			sumScore += rankings[i].Score
+		}
+		avgScore := sumScore / float64(endIdx-startIdx)
+
+		// Calculate bar length (inverse of normalized score)
+		barLength := width - 1
+		if maxScore > 0 {
+			barLength = int((1.0 - avgScore/maxScore) * float64(width-1))
+		}
+		if barLength < 0 {
+			barLength = 0
+		}
+		if barLength > width-1 {
+			barLength = width - 1
+		}
+
+		// Check if this row contains the elbow
+		containsElbow := false
+		if elbowIndex >= startIdx && elbowIndex < endIdx {
+			containsElbow = true
+		}
+
+		// Determine color
+		style := tcell.StyleDefault.Foreground(tcell.ColorWhite)
+		if containsElbow {
+			style = tcell.StyleDefault.Foreground(tcell.ColorRed)
+		}
+
+		// Draw bar
+		for x := 0; x < barLength && x < width-1; x++ {
+			screen.SetContent(startX+x, y, '█', nil, style)
+		}
+	}
+}
+
+// renderMainDisplay renders the main detailed ranking display
+func (r *Ranker) renderMainDisplay(screen tcell.Screen, rankings []traceDocument, round, trial int, startX, maxWidth, maxHeight int) {
+	// Help text
+	help := "Press Ctrl+C, Esc, or 'q' to quit"
+	r.writeString(screen, startX, 0, help, tcell.StyleDefault.Foreground(tcell.ColorDarkGray))
+
+	// Header
+	header := fmt.Sprintf("Round %d | Trial %d | Items: %d", round, trial, len(rankings))
+	r.writeString(screen, startX, 1, header, tcell.StyleDefault.Bold(true))
+
+	// Calculate max score for normalization
+	maxScore := 0.0
+	if len(rankings) > 0 {
+		maxScore = rankings[len(rankings)-1].Score
+	}
+
+	// Rankings (one per line, starting at row 3)
+	for i, doc := range rankings {
+		row := i + 3
+		if row >= maxHeight {
+			break // Don't render beyond screen height
+		}
+
+		// Calculate bar length proportional to score (invert so lower score = longer bar)
+		barLength := maxWidth - 10 // Reserve space for score display
+		if maxScore > 0 {
+			barLength = int((1.0 - doc.Score/maxScore) * float64(maxWidth-10))
+		}
+		if barLength < 0 {
+			barLength = 0
+		}
+
+		// Styles
+		whiteStyle := tcell.StyleDefault.Foreground(tcell.ColorWhite)
+		grayStyle := tcell.StyleDefault.Foreground(tcell.ColorGray)
+
+		// Draw document text as the bar
+		x := startX
+		for _, ch := range doc.Value {
+			if x-startX >= maxWidth-10 {
+				break // Leave room for score
+			}
+
+			// White for bar portion, gray for overflow
+			style := whiteStyle
+			if x-startX >= barLength {
+				style = grayStyle
+			}
+			screen.SetContent(x, row, ch, nil, style)
+			x++
+		}
+
+		// Fill remaining bar space with '+' if text is shorter than bar
+		for x-startX < barLength && x-startX < maxWidth-10 {
+			screen.SetContent(x, row, '+', nil, whiteStyle)
+			x++
+		}
+
+		// Show score at the end
+		scoreLabel := fmt.Sprintf(" %.2f", doc.Score)
+		r.writeString(screen, startX+maxWidth-9, row, scoreLabel, tcell.StyleDefault.Foreground(tcell.ColorYellow))
+	}
 }
 
 func (r *Ranker) logFromApiCall(trialNum, batchNum int, message string, args ...interface{}) {
@@ -933,8 +1237,14 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 	r.elbowCutoff = -1     // Reset cutoff
 	r.mu.Unlock()
 
+	// Shared scores for convergence detection and final ranking (all trials combined)
 	scores := make(map[string][]float64)
 	var scoresMutex sync.Mutex
+
+	// Per-trial scores for building cumulative trace snapshots
+	// Structure: trialScores[trialNumber][documentID] = []float64{scores from that trial}
+	trialScores := make(map[int]map[string][]float64)
+	var trialScoresMutex sync.Mutex
 
 	type workItem struct {
 		trialNum int
@@ -1092,12 +1402,25 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 			continue
 		}
 
-		// Thread-safe update of shared maps
+		// Thread-safe update of shared scores (for convergence detection and final ranking)
 		scoresMutex.Lock()
 		for _, rankedDoc := range result.rankedDocs {
 			scores[rankedDoc.Document.ID] = append(scores[rankedDoc.Document.ID], rankedDoc.Score)
 		}
 		scoresMutex.Unlock()
+
+		// Track scores per trial for cumulative trace snapshots
+		trialScoresMutex.Lock()
+		if trialScores[result.trialNumber] == nil {
+			trialScores[result.trialNumber] = make(map[string][]float64)
+		}
+		for _, rankedDoc := range result.rankedDocs {
+			trialScores[result.trialNumber][rankedDoc.Document.ID] = append(
+				trialScores[result.trialNumber][rankedDoc.Document.ID],
+				rankedDoc.Score,
+			)
+		}
+		trialScoresMutex.Unlock()
 
 		// Track comparisons globally (across all rounds/trials)
 		r.mu.Lock()
@@ -1158,11 +1481,25 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 			r.mu.Unlock()
 
 			// Check for convergence (this adds the current trial's elbow to the array)
+			// Note: hasConverged uses the shared 'scores' map (all trials) which is correct
 			converged := r.hasConverged(scores, result.trialNumber)
 
-			// Write trace line (after convergence check so current elbow is included)
-			if err := r.writeTraceLine(completedTrialsCount, completedTrialsCount, scores, documents); err != nil {
-				r.cfg.Logger.Error("Failed to write trace line", "error", err)
+			// Build cumulative scores from ALL trials that have fully completed
+			// (regardless of their trial numbers - we care about completion order, not launch order)
+			trialScoresMutex.Lock()
+			cumulativeScores := make(map[string][]float64)
+			for trialNum := range completedTrials {
+				if trialData, exists := trialScores[trialNum]; exists {
+					for docID, scoreList := range trialData {
+						cumulativeScores[docID] = append(cumulativeScores[docID], scoreList...)
+					}
+				}
+			}
+			trialScoresMutex.Unlock()
+
+			// Record trial state with cumulative scores from trials 1..N only
+			if err := r.recordTrialState(completedTrialsCount, completedTrialsCount, cumulativeScores, documents); err != nil {
+				r.cfg.Logger.Error("Failed to record trial state", "error", err)
 			}
 
 			// Signal workers to stop if converged
@@ -1254,9 +1591,9 @@ func perpendicularDistance(x0, y0, x1, y1, x2, y2 float64) float64 {
 	return numerator / denominator
 }
 
-// findElbow returns the index of the elbow in a sorted list of ranked documents
-// Returns -1 if elbow cannot be determined (e.g., too few documents)
-func findElbow(rankedDocs []RankedDocument) int {
+// findElbowPerpendicular returns the index of the elbow using perpendicular distance method.
+// Returns -1 if elbow cannot be determined (e.g., too few documents).
+func findElbowPerpendicular(rankedDocs []RankedDocument) int {
 	n := len(rankedDocs)
 
 	// Need at least 3 documents to find an elbow
@@ -1293,6 +1630,155 @@ func findElbow(rankedDocs []RankedDocument) int {
 	}
 
 	return elbowIdx
+}
+
+// findElbow dispatches to the appropriate elbow detection method based on the method name.
+// Valid methods: "curvature" (default), "perpendicular".
+func findElbow(rankedDocs []RankedDocument, method string) int {
+	switch method {
+	case "perpendicular":
+		return findElbowPerpendicular(rankedDocs)
+	case "curvature", "":
+		return findElbowCurvature(rankedDocs)
+	default:
+		// Shouldn't happen if config validation is correct, but default to curvature
+		return findElbowCurvature(rankedDocs)
+	}
+}
+
+// gaussianSmooth applies 1D Gaussian smoothing to a slice of values.
+// sigma controls the width of the Gaussian kernel.
+func gaussianSmooth(data []float64, sigma float64) []float64 {
+	n := len(data)
+	if n == 0 {
+		return data
+	}
+
+	// Kernel radius: typically 3*sigma is sufficient to capture 99.7% of the Gaussian
+	radius := int(math.Ceil(3 * sigma))
+	if radius < 1 {
+		radius = 1
+	}
+
+	// Build Gaussian kernel
+	kernelSize := 2*radius + 1
+	kernel := make([]float64, kernelSize)
+	var kernelSum float64
+	for i := 0; i < kernelSize; i++ {
+		x := float64(i - radius)
+		kernel[i] = math.Exp(-(x * x) / (2 * sigma * sigma))
+		kernelSum += kernel[i]
+	}
+	// Normalize kernel
+	for i := range kernel {
+		kernel[i] /= kernelSum
+	}
+
+	// Apply convolution with boundary handling (extend edge values)
+	result := make([]float64, n)
+	for i := 0; i < n; i++ {
+		var sum float64
+		for k := 0; k < kernelSize; k++ {
+			// Map kernel index to data index with boundary clamping
+			dataIdx := i + (k - radius)
+			if dataIdx < 0 {
+				dataIdx = 0
+			} else if dataIdx >= n {
+				dataIdx = n - 1
+			}
+			sum += data[dataIdx] * kernel[k]
+		}
+		result[i] = sum
+	}
+
+	return result
+}
+
+// gradient calculates the numerical gradient (first derivative) of a slice.
+// Uses central differences for interior points and forward/backward differences at edges.
+func gradient(data []float64) []float64 {
+	n := len(data)
+	if n < 2 {
+		return make([]float64, n)
+	}
+
+	result := make([]float64, n)
+
+	// Forward difference at start
+	result[0] = data[1] - data[0]
+
+	// Central differences for interior
+	for i := 1; i < n-1; i++ {
+		result[i] = (data[i+1] - data[i-1]) / 2.0
+	}
+
+	// Backward difference at end
+	result[n-1] = data[n-1] - data[n-2]
+
+	return result
+}
+
+// findElbowCurvature returns the index of the elbow in a sorted list of ranked documents
+// using curvature-based detection. It finds the point of maximum curvature
+// (global minimum of 2nd derivative) which represents the transition from
+// the steep "interesting" section to the flatter "tail" section.
+// Returns -1 if elbow cannot be determined (e.g., too few documents or flat scores).
+func findElbowCurvature(rankedDocs []RankedDocument) int {
+	n := len(rankedDocs)
+
+	// Need at least 4 documents to find an elbow meaningfully
+	if n < 4 {
+		return -1
+	}
+
+	// Extract scores
+	scores := make([]float64, n)
+	for i, doc := range rankedDocs {
+		scores[i] = doc.Score
+	}
+
+	// Check if scores are flat (all identical within epsilon)
+	const epsilon = 1e-9
+	firstScore := scores[0]
+	allFlat := true
+	for _, score := range scores {
+		if math.Abs(score-firstScore) > epsilon {
+			allFlat = false
+			break
+		}
+	}
+	if allFlat {
+		return -1
+	}
+
+	// Calculate sigma: 3% of dataset size, minimum 1.0
+	sigma := math.Max(1.0, float64(n)*0.03)
+
+	// Step 1: Smooth the scores
+	smoothedScores := gaussianSmooth(scores, sigma)
+
+	// Step 2: Calculate derivatives (cascade approach)
+	// 1st derivative from smoothed scores
+	firstDeriv := gradient(smoothedScores)
+	// Smooth the 1st derivative
+	smoothedFirstDeriv := gaussianSmooth(firstDeriv, sigma)
+	// 2nd derivative from smoothed 1st derivative
+	secondDeriv := gradient(smoothedFirstDeriv)
+	// Smooth the 2nd derivative
+	smoothedSecondDeriv := gaussianSmooth(secondDeriv, sigma)
+
+	// Step 3: Find the global minimum of the 2nd derivative
+	// This is the point of maximum curvature
+	minVal := smoothedSecondDeriv[0]
+	minIdx := 0
+	for i := 1; i < n; i++ {
+		if smoothedSecondDeriv[i] < minVal {
+			minVal = smoothedSecondDeriv[i]
+			minIdx = i
+		}
+	}
+
+	return minIdx
 }
 
 // countStableElbows returns how many consecutive recent elbow positions are within tolerance
@@ -1428,7 +1914,7 @@ func (r *Ranker) hasConverged(scores map[string][]float64, completedTrialNum int
 	var elbowStable bool
 	var actualTolerance int
 
-	elbowPos := findElbow(currentRankings)
+	elbowPos := findElbow(currentRankings, r.cfg.ElbowMethod)
 	if elbowPos != -1 {
 		// Store elbow position
 		r.mu.Lock()
