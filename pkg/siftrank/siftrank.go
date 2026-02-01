@@ -458,16 +458,6 @@ func (r *Ranker) RankFromFile(filePath string, templateData string, forceJSON bo
 
 	// Initialize terminal visualization if enabled
 	if r.cfg.Watch {
-		// Redirect logger to file when in observe mode to avoid clobbering TUI
-		logFile, err := os.OpenFile("siftrank.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err == nil {
-			r.cfg.Logger = slog.New(slog.NewTextHandler(logFile, &slog.HandlerOptions{
-				Level:     r.cfg.LogLevel,
-				AddSource: false,
-			})).With("component", "siftrank")
-			defer logFile.Close()
-		}
-
 		screen, err := tcell.NewScreen()
 		if err != nil {
 			r.cfg.Logger.Warn("Failed to create screen for visualization", "error", err)
