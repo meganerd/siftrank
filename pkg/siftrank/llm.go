@@ -27,9 +27,11 @@ type LLMProvider interface {
 	// Returns: raw response string, error
 	// Error only for unrecoverable network issues (bad auth, context cancelled)
 	Complete(ctx context.Context, prompt string, opts *CompletionOptions) (string, error)
+}
 
-	// EstimateTokens estimates token count for text.
-	// Returns -1 if estimation not supported.
+// TokenEstimator is an optional interface that LLMProviders can implement
+// to provide accurate token estimation for batch sizing.
+type TokenEstimator interface {
 	EstimateTokens(text string) int
 }
 
@@ -68,7 +70,11 @@ type Usage struct {
 	InputTokens     int // Prompt tokens
 	OutputTokens    int // Completion tokens
 	ReasoningTokens int // Reasoning tokens (o1/o3 models)
-	TotalTokens     int // Sum of all tokens
+}
+
+// TotalTokens returns the sum of all token counts
+func (u Usage) TotalTokens() int {
+	return u.InputTokens + u.OutputTokens + u.ReasoningTokens
 }
 
 // Add adds another Usage's tokens to this Usage
@@ -76,7 +82,6 @@ func (u *Usage) Add(other Usage) {
 	u.InputTokens += other.InputTokens
 	u.OutputTokens += other.OutputTokens
 	u.ReasoningTokens += other.ReasoningTokens
-	u.TotalTokens += other.TotalTokens
 }
 
 // generateSchema generates a JSON schema from a Go type

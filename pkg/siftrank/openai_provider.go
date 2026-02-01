@@ -179,7 +179,6 @@ func (p *OpenAIProvider) Complete(ctx context.Context, prompt string, opts *Comp
 				callUsage.ReasoningTokens = int(completion.Usage.CompletionTokensDetails.ReasoningTokens)
 			}
 
-			callUsage.TotalTokens = callUsage.InputTokens + callUsage.OutputTokens + callUsage.ReasoningTokens
 			totalUsage.Add(callUsage)
 
 			// Populate output fields in opts

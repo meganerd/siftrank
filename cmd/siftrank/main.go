@@ -238,7 +238,7 @@ func run(cmd *cobra.Command, args []string) error {
 		ElbowTolerance:    elbowTolerance,
 		StableTrials:      stableTrials,
 		MinTrials:         minTrials,
-		ElbowMethod:       elbowMethod,
+		ElbowMethod:       siftrank.ElbowMethod(elbowMethod),
 	}
 
 	// Create ranker

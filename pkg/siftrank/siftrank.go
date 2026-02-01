@@ -1,7 +1,6 @@
 package siftrank
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -31,6 +30,14 @@ import (
 const (
 	idLen        = 8
 	minBatchSize = 2
+)
+
+// ElbowMethod specifies the algorithm for detecting the elbow point in rankings
+type ElbowMethod string
+
+const (
+	ElbowMethodCurvature     ElbowMethod = "curvature"
+	ElbowMethodPerpendicular ElbowMethod = "perpendicular"
 )
 
 // Word lists for generating memorable IDs
@@ -88,7 +95,7 @@ type Config struct {
 	ElbowTolerance    float64 `json:"elbow_tolerance"`
 	StableTrials      int     `json:"stable_trials"`
 	MinTrials         int     `json:"min_trials"`
-	ElbowMethod string `json:"elbow_method"` // "curvature" (default) or "perpendicular"
+	ElbowMethod ElbowMethod `json:"elbow_method"` // ElbowMethodCurvature (default) or ElbowMethodPerpendicular
 
 	// LLM configuration
 	LLMProvider LLMProvider `json:"-"` // Optional: if nil, creates default OpenAI provider
@@ -139,10 +146,28 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("minimum trials must be at least 2")
 		}
 	}
-	if c.ElbowMethod != "" && c.ElbowMethod != "curvature" && c.ElbowMethod != "perpendicular" {
-		return fmt.Errorf("elbow method must be 'curvature' or 'perpendicular', got '%s'", c.ElbowMethod)
+	if c.ElbowMethod != "" && c.ElbowMethod != ElbowMethodCurvature && c.ElbowMethod != ElbowMethodPerpendicular {
+		return fmt.Errorf("elbow method must be ElbowMethodCurvature or ElbowMethodPerpendicular, got '%s'", c.ElbowMethod)
 	}
 	return nil
+}
+
+// NewConfig returns a Config with sensible defaults matching the CLI.
+// Callers should set at minimum: InitialPrompt and OpenAIKey (or LLMProvider).
+func NewConfig() *Config {
+	return &Config{
+		BatchSize:         10,
+		NumTrials:         50,
+		Concurrency:       50,
+		BatchTokens:       128000,
+		RefinementRatio:   0.5,
+		Encoding:          "o200k_base",
+		ElbowMethod:       ElbowMethodCurvature,
+		ElbowTolerance:    0.05,
+		StableTrials:      5,
+		MinTrials:         5,
+		EnableConvergence: true,
+	}
 }
 
 type docStats struct {
@@ -432,13 +457,45 @@ func ShortDeterministicID(input string, length int) string {
 	return filtered[:length]
 }
 
-// ranks documents loaded from a file with optional template
+// RankFromFile ranks documents loaded from a file with optional template.
 func (r *Ranker) RankFromFile(filePath string, templateData string, forceJSON bool) ([]RankedDocument, error) {
 	documents, err := r.loadDocumentsFromFile(filePath, templateData, forceJSON)
 	if err != nil {
 		return nil, err
 	}
 
+	// Open trace file if specified (only makes sense for file-based operation)
+	if r.cfg.TracePath != "" {
+		traceFile, err := os.Create(r.cfg.TracePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create trace file: %w", err)
+		}
+		r.traceFile = traceFile
+		defer func() {
+			if err := r.traceFile.Close(); err != nil {
+				r.cfg.Logger.Warn("Failed to close trace file", "error", err)
+			}
+		}()
+	}
+
+	return r.rankDocuments(documents)
+}
+
+// RankFromReader ranks documents read from an io.Reader.
+// For text input, each line is treated as a document.
+// For JSON input (isJSON=true), expects a JSON array of objects.
+// templateData uses Go template syntax; for text input, use {{.Data}} to reference each line.
+func (r *Ranker) RankFromReader(reader io.Reader, templateData string, isJSON bool) ([]RankedDocument, error) {
+	documents, err := r.loadDocumentsFromReader(reader, templateData, isJSON)
+	if err != nil {
+		return nil, err
+	}
+
+	return r.rankDocuments(documents)
+}
+
+// rankDocuments performs the core ranking logic on a set of documents.
+func (r *Ranker) rankDocuments(documents []document) ([]RankedDocument, error) {
 	// check that no document is too large
 	for _, doc := range documents {
 		tokens := r.estimateTokens([]document{doc}, true)
@@ -503,20 +560,6 @@ func (r *Ranker) RankFromFile(filePath string, templateData string, forceJSON bo
 				}()
 			}
 		}
-	}
-
-	// Open trace file if specified
-	if r.cfg.TracePath != "" {
-		traceFile, err := os.Create(r.cfg.TracePath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create trace file: %w", err)
-		}
-		r.traceFile = traceFile
-		defer func() {
-			if err := r.traceFile.Close(); err != nil {
-				r.cfg.Logger.Warn("Failed to close trace file", "error", err)
-			}
-		}()
 	}
 
 	// Initialize global comparison tracking for exposure calculation
@@ -648,7 +691,21 @@ func (r *Ranker) RankFromFile(filePath string, templateData string, forceJSON bo
 	return results, nil
 }
 
-func (r *Ranker) loadDocumentsFromFile(filePath string, templateData string, forceJSON bool) (documents []document, err error) {
+func (r *Ranker) loadDocumentsFromFile(filePath string, templateData string, forceJSON bool) ([]document, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open input file %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	ext := strings.ToLower(filepath.Ext(filePath))
+	isJSON := ext == ".json" || forceJSON
+
+	return r.loadDocumentsFromReader(file, templateData, isJSON)
+}
+
+func (r *Ranker) loadDocumentsFromReader(reader io.Reader, templateData string, isJSON bool) ([]document, error) {
+	// Template parsing
 	var tmpl *template.Template
 	if templateData != "" {
 		if templateData[0] == '@' {
@@ -658,70 +715,74 @@ func (r *Ranker) loadDocumentsFromFile(filePath string, templateData string, for
 			}
 			templateData = string(content)
 		}
+		var err error
 		if tmpl, err = template.New("siftrank-item-template").Parse(templateData); err != nil {
 			return nil, fmt.Errorf("failed to parse template: %w", err)
 		}
 	}
 
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open input file %s: %w", filePath, err)
+	if isJSON {
+		return r.loadJSONDocuments(reader, tmpl)
 	}
-	defer file.Close()
+	return r.loadTextDocuments(reader, tmpl)
+}
 
-	ext := strings.ToLower(filepath.Ext(filePath))
-	if ext == ".json" || forceJSON {
-		// parse the file in an opaque array
-		var data []interface{}
-		if err := json.NewDecoder(file).Decode(&data); err != nil {
-			return nil, fmt.Errorf("failed to decode JSON from %s: %w", filePath, err)
+func (r *Ranker) loadTextDocuments(reader io.Reader, tmpl *template.Template) ([]document, error) {
+	content, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read content: %w", err)
+	}
+
+	var documents []document
+	lines := strings.Split(string(content), "\n")
+
+	for _, line := range lines {
+		line = strings.TrimRight(line, "\r") // Handle Windows line endings
+		if line == "" {
+			continue // Skip empty lines
 		}
 
-		// iterate over the map and create documents
-		for _, value := range data {
-			var valueStr string
-			if tmpl != nil {
-				var tmplData bytes.Buffer
-				if err := tmpl.Execute(&tmplData, value); err != nil {
-					return nil, fmt.Errorf("failed to execute template: %w", err)
-				}
-				valueStr = tmplData.String()
-			} else {
-				r.cfg.Logger.Warn("using json input without a template, using JSON document as it is")
-				jsonValue, err := json.Marshal(value)
-				if err != nil {
-					return nil, fmt.Errorf("failed to marshal JSON value: %w", err)
-				}
-				valueStr = string(jsonValue)
+		if tmpl != nil {
+			var tmplData bytes.Buffer
+			if err := tmpl.Execute(&tmplData, map[string]string{"Data": line}); err != nil {
+				return nil, fmt.Errorf("failed to execute template on line: %w", err)
 			}
-
-			id := ShortDeterministicID(valueStr, idLen)
-			documents = append(documents, document{ID: id, Document: value, Value: valueStr})
+			line = tmplData.String()
 		}
-	} else {
-		// read and interpolate the file line by line
-		reader := bufio.NewReader(file)
-		for {
-			line, err := reader.ReadString('\n')
+
+		id := ShortDeterministicID(line, idLen)
+		documents = append(documents, document{ID: id, Document: nil, Value: line})
+	}
+
+	return documents, nil
+}
+
+func (r *Ranker) loadJSONDocuments(reader io.Reader, tmpl *template.Template) ([]document, error) {
+	var data []interface{}
+	if err := json.NewDecoder(reader).Decode(&data); err != nil {
+		return nil, fmt.Errorf("failed to decode JSON: %w", err)
+	}
+
+	var documents []document
+	for _, value := range data {
+		var valueStr string
+		if tmpl != nil {
+			var tmplData bytes.Buffer
+			if err := tmpl.Execute(&tmplData, value); err != nil {
+				return nil, fmt.Errorf("failed to execute template: %w", err)
+			}
+			valueStr = tmplData.String()
+		} else {
+			r.cfg.Logger.Warn("using json input without a template, using JSON document as-is")
+			jsonValue, err := json.Marshal(value)
 			if err != nil {
-				if err == io.EOF {
-					break
-				}
-				return nil, fmt.Errorf("failed to read line from %s: %w", filePath, err)
+				return nil, fmt.Errorf("failed to marshal JSON value: %w", err)
 			}
-			line = strings.TrimSpace(line)
-
-			if tmpl != nil {
-				var tmplData bytes.Buffer
-				if err := tmpl.Execute(&tmplData, map[string]string{"Data": line}); err != nil {
-					return nil, fmt.Errorf("failed to execute template on line: %w", err)
-				}
-				line = tmplData.String()
-			}
-
-			id := ShortDeterministicID(line, idLen)
-			documents = append(documents, document{ID: id, Document: nil, Value: line})
+			valueStr = string(jsonValue)
 		}
+
+		id := ShortDeterministicID(valueStr, idLen)
+		documents = append(documents, document{ID: id, Document: value, Value: valueStr})
 	}
 
 	return documents, nil
@@ -1633,12 +1694,12 @@ func findElbowPerpendicular(rankedDocs []RankedDocument) int {
 }
 
 // findElbow dispatches to the appropriate elbow detection method based on the method name.
-// Valid methods: "curvature" (default), "perpendicular".
-func findElbow(rankedDocs []RankedDocument, method string) int {
+// Valid methods: ElbowMethodCurvature (default), ElbowMethodPerpendicular.
+func findElbow(rankedDocs []RankedDocument, method ElbowMethod) int {
 	switch method {
-	case "perpendicular":
+	case ElbowMethodPerpendicular:
 		return findElbowPerpendicular(rankedDocs)
-	case "curvature", "":
+	case ElbowMethodCurvature, "":
 		return findElbowCurvature(rankedDocs)
 	default:
 		// Shouldn't happen if config validation is correct, but default to curvature
@@ -2089,12 +2150,13 @@ func (r *Ranker) estimateTokens(group []document, includePrompt bool) int {
 		text += fmt.Sprintf(promptFmt, doc.ID, doc.Value)
 	}
 
-	tokens := r.provider.EstimateTokens(text)
-	if tokens < 0 {
-		// Provider doesn't support estimation, use rough approximation
-		return len(text) / 4
+	// Check if provider supports token estimation
+	if estimator, ok := r.provider.(TokenEstimator); ok {
+		return estimator.EstimateTokens(text)
 	}
-	return tokens
+
+	// Fallback: rough approximation (~4 chars per token)
+	return len(text) / 4
 }
 
 // extractJSON attempts to extract JSON from various response formats.
