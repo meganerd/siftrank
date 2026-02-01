@@ -98,6 +98,7 @@ type Config struct {
 	ElbowTolerance    float64 `json:"elbow_tolerance"`
 	StableTrials      int     `json:"stable_trials"`
 	MinTrials         int     `json:"min_trials"`
+	ElbowMethod       string  `json:"elbow_method"` // "curvature" (default) or "perpendicular"
 
 	// Visualization
 	Watch     bool `json:"-"` // Enable live terminal visualization
@@ -136,6 +137,9 @@ func (c *Config) Validate() error {
 		if c.MinTrials < 2 {
 			return fmt.Errorf("minimum trials must be at least 2")
 		}
+	}
+	if c.ElbowMethod != "" && c.ElbowMethod != "curvature" && c.ElbowMethod != "perpendicular" {
+		return fmt.Errorf("elbow method must be 'curvature' or 'perpendicular', got '%s'", c.ElbowMethod)
 	}
 	return nil
 }
@@ -1620,9 +1624,9 @@ func perpendicularDistance(x0, y0, x1, y1, x2, y2 float64) float64 {
 	return numerator / denominator
 }
 
-// findElbow returns the index of the elbow in a sorted list of ranked documents
-// Returns -1 if elbow cannot be determined (e.g., too few documents)
-func findElbow(rankedDocs []RankedDocument) int {
+// findElbowPerpendicular returns the index of the elbow using perpendicular distance method.
+// Returns -1 if elbow cannot be determined (e.g., too few documents).
+func findElbowPerpendicular(rankedDocs []RankedDocument) int {
 	n := len(rankedDocs)
 
 	// Need at least 3 documents to find an elbow
@@ -1659,6 +1663,155 @@ func findElbow(rankedDocs []RankedDocument) int {
 	}
 
 	return elbowIdx
+}
+
+// findElbow dispatches to the appropriate elbow detection method based on the method name.
+// Valid methods: "curvature" (default), "perpendicular".
+func findElbow(rankedDocs []RankedDocument, method string) int {
+	switch method {
+	case "perpendicular":
+		return findElbowPerpendicular(rankedDocs)
+	case "curvature", "":
+		return findElbowCurvature(rankedDocs)
+	default:
+		// Shouldn't happen if config validation is correct, but default to curvature
+		return findElbowCurvature(rankedDocs)
+	}
+}
+
+// gaussianSmooth applies 1D Gaussian smoothing to a slice of values.
+// sigma controls the width of the Gaussian kernel.
+func gaussianSmooth(data []float64, sigma float64) []float64 {
+	n := len(data)
+	if n == 0 {
+		return data
+	}
+
+	// Kernel radius: typically 3*sigma is sufficient to capture 99.7% of the Gaussian
+	radius := int(math.Ceil(3 * sigma))
+	if radius < 1 {
+		radius = 1
+	}
+
+	// Build Gaussian kernel
+	kernelSize := 2*radius + 1
+	kernel := make([]float64, kernelSize)
+	var kernelSum float64
+	for i := 0; i < kernelSize; i++ {
+		x := float64(i - radius)
+		kernel[i] = math.Exp(-(x * x) / (2 * sigma * sigma))
+		kernelSum += kernel[i]
+	}
+	// Normalize kernel
+	for i := range kernel {
+		kernel[i] /= kernelSum
+	}
+
+	// Apply convolution with boundary handling (extend edge values)
+	result := make([]float64, n)
+	for i := 0; i < n; i++ {
+		var sum float64
+		for k := 0; k < kernelSize; k++ {
+			// Map kernel index to data index with boundary clamping
+			dataIdx := i + (k - radius)
+			if dataIdx < 0 {
+				dataIdx = 0
+			} else if dataIdx >= n {
+				dataIdx = n - 1
+			}
+			sum += data[dataIdx] * kernel[k]
+		}
+		result[i] = sum
+	}
+
+	return result
+}
+
+// gradient calculates the numerical gradient (first derivative) of a slice.
+// Uses central differences for interior points and forward/backward differences at edges.
+func gradient(data []float64) []float64 {
+	n := len(data)
+	if n < 2 {
+		return make([]float64, n)
+	}
+
+	result := make([]float64, n)
+
+	// Forward difference at start
+	result[0] = data[1] - data[0]
+
+	// Central differences for interior
+	for i := 1; i < n-1; i++ {
+		result[i] = (data[i+1] - data[i-1]) / 2.0
+	}
+
+	// Backward difference at end
+	result[n-1] = data[n-1] - data[n-2]
+
+	return result
+}
+
+// findElbowCurvature returns the index of the elbow in a sorted list of ranked documents
+// using curvature-based detection. It finds the point of maximum curvature
+// (global minimum of 2nd derivative) which represents the transition from
+// the steep "interesting" section to the flatter "tail" section.
+// Returns -1 if elbow cannot be determined (e.g., too few documents or flat scores).
+func findElbowCurvature(rankedDocs []RankedDocument) int {
+	n := len(rankedDocs)
+
+	// Need at least 4 documents to find an elbow meaningfully
+	if n < 4 {
+		return -1
+	}
+
+	// Extract scores
+	scores := make([]float64, n)
+	for i, doc := range rankedDocs {
+		scores[i] = doc.Score
+	}
+
+	// Check if scores are flat (all identical within epsilon)
+	const epsilon = 1e-9
+	firstScore := scores[0]
+	allFlat := true
+	for _, score := range scores {
+		if math.Abs(score-firstScore) > epsilon {
+			allFlat = false
+			break
+		}
+	}
+	if allFlat {
+		return -1
+	}
+
+	// Calculate sigma: 3% of dataset size, minimum 1.0
+	sigma := math.Max(1.0, float64(n)*0.03)
+
+	// Step 1: Smooth the scores
+	smoothedScores := gaussianSmooth(scores, sigma)
+
+	// Step 2: Calculate derivatives (cascade approach)
+	// 1st derivative from smoothed scores
+	firstDeriv := gradient(smoothedScores)
+	// Smooth the 1st derivative
+	smoothedFirstDeriv := gaussianSmooth(firstDeriv, sigma)
+	// 2nd derivative from smoothed 1st derivative
+	secondDeriv := gradient(smoothedFirstDeriv)
+	// Smooth the 2nd derivative
+	smoothedSecondDeriv := gaussianSmooth(secondDeriv, sigma)
+
+	// Step 3: Find the global minimum of the 2nd derivative
+	// This is the point of maximum curvature
+	minVal := smoothedSecondDeriv[0]
+	minIdx := 0
+	for i := 1; i < n; i++ {
+		if smoothedSecondDeriv[i] < minVal {
+			minVal = smoothedSecondDeriv[i]
+			minIdx = i
+		}
+	}
+
+	return minIdx
 }
 
 // countStableElbows returns how many consecutive recent elbow positions are within tolerance
@@ -1794,7 +1947,7 @@ func (r *Ranker) hasConverged(scores map[string][]float64, completedTrialNum int
 	var elbowStable bool
 	var actualTolerance int
 
-	elbowPos := findElbow(currentRankings)
+	elbowPos := findElbow(currentRankings, r.cfg.ElbowMethod)
 	if elbowPos != -1 {
 		// Store elbow position
 		r.mu.Lock()
