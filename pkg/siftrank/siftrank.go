@@ -597,7 +597,10 @@ func (r *Ranker) rankDocuments(documents []document) ([]*RankedDocument, error) 
 		}
 	}
 
-	results := r.rank(documents, 1)
+	results, err := r.rank(documents, 1)
+	if err != nil {
+		return nil, err
+	}
 
 	// Summarize relevance if enabled
 	if r.cfg.Relevance {
@@ -818,7 +821,7 @@ func (r *Ranker) loadJSONDocuments(reader io.Reader, tmpl *template.Template) ([
 }
 
 // perform the ranking algorithm on the given documents
-func (r *Ranker) rank(documents []document, round int) []*RankedDocument {
+func (r *Ranker) rank(documents []document, round int) ([]*RankedDocument, error) {
 	r.round = round
 
 	// Track original document count for exposure calculation
@@ -840,7 +843,7 @@ func (r *Ranker) rank(documents []document, round int) []*RankedDocument {
 				Rounds:     round,
 				InputIndex: documents[0].InputIndex,
 			},
-		}
+		}, nil
 	}
 
 	// Downstream ranking gets unhappy if we try to rank more documents than we
@@ -852,7 +855,10 @@ func (r *Ranker) rank(documents []document, round int) []*RankedDocument {
 	r.numBatches = len(documents) / r.cfg.BatchSize
 
 	// Process the documents and get the sorted results.
-	results := r.shuffleBatchRank(documents)
+	results, err := r.shuffleBatchRank(documents)
+	if err != nil {
+		return nil, err
+	}
 
 	// Determine cutoff for refinement
 	var mid int
@@ -871,12 +877,12 @@ func (r *Ranker) rank(documents []document, round int) []*RankedDocument {
 				"round", r.round,
 				"total_docs", len(results),
 				"elbow_cutoff", r.elbowCutoff)
-			return results
+			return results, nil
 		}
 	} else {
 		// Non-convergence mode: use ratio
 		if r.cfg.RefinementRatio == 0 {
-			return results
+			return results, nil
 		}
 		mid = int(float64(len(results)) * r.cfg.RefinementRatio)
 		r.cfg.Logger.Debug("Using ratio cutoff for refinement",
@@ -888,7 +894,7 @@ func (r *Ranker) rank(documents []document, round int) []*RankedDocument {
 
 	// Ensure we have at least 2 documents for meaningful ranking
 	if mid < 2 {
-		return results
+		return results, nil
 	}
 
 	topPortion := results[:mid]
@@ -897,7 +903,7 @@ func (r *Ranker) rank(documents []document, round int) []*RankedDocument {
 	// If we haven't reduced the number of documents (as may eventually happen
 	// for a ratio above 0.5), we're done.
 	if len(topPortion) == len(documents) {
-		return results
+		return results, nil
 	}
 
 	r.cfg.Logger.Debug("Top items being sent back into recursion:")
@@ -907,10 +913,13 @@ func (r *Ranker) rank(documents []document, round int) []*RankedDocument {
 
 	var topPortionDocs []document
 	for _, result := range topPortion {
-		topPortionDocs = append(topPortionDocs, document{ID: result.Key, Value: result.Value, Document: result.Document})
+		topPortionDocs = append(topPortionDocs, document{ID: result.Key, Value: result.Value, Document: result.Document, InputIndex: result.InputIndex})
 	}
 
-	refinedTopPortion := r.rank(topPortionDocs, round+1)
+	refinedTopPortion, err := r.rank(topPortionDocs, round+1)
+	if err != nil {
+		return nil, err
+	}
 
 	// Adjust scores by recursion depth; this serves as an inverted weight so
 	// that later rounds are guaranteed to sit higher in the final list.
@@ -921,7 +930,7 @@ func (r *Ranker) rank(documents []document, round int) []*RankedDocument {
 	// Combine the refined top portion with the unrefined bottom portion.
 	finalResults := append(refinedTopPortion, bottomPortion...)
 
-	return finalResults
+	return finalResults, nil
 }
 
 func (r *Ranker) summarizeRelevance(docID string, docValue string, snippets []string) (*RelevanceProsCons, Usage, error) {
@@ -1319,7 +1328,7 @@ func (r *Ranker) logFromApiCall(trialNum, batchNum int, message string, args ...
 	r.cfg.Logger.Debug(formattedMessage, "round", r.round, "trial", trialNum, "total_trials", r.cfg.NumTrials, "batch", batchNum, "total_batches", r.numBatches)
 }
 
-func (r *Ranker) shuffleBatchRank(documents []document) []*RankedDocument {
+func (r *Ranker) shuffleBatchRank(documents []document) ([]*RankedDocument, error) {
 	// Reset convergence state for this recursion level (round)
 	r.mu.Lock()
 	r.converged = false
@@ -1482,6 +1491,9 @@ func (r *Ranker) shuffleBatchRank(documents []document) []*RankedDocument {
 	}
 	trialStatsMap := make(map[int]*trialStats) // trial number -> stats
 
+	// Track fatal errors that should propagate to callers
+	var fatalErr error
+
 	// Collect results
 	for result := range resultsChan {
 		if result.err != nil {
@@ -1490,6 +1502,10 @@ func (r *Ranker) shuffleBatchRank(documents []document) []*RankedDocument {
 				continue
 			}
 			r.cfg.Logger.Error("Error in batch processing", "error", result.err)
+			// Store the first fatal error to return to caller
+			if fatalErr == nil {
+				fatalErr = result.err
+			}
 			continue
 		}
 
@@ -1663,7 +1679,12 @@ func (r *Ranker) shuffleBatchRank(documents []document) []*RankedDocument {
 	// Set elbow cutoff for refinement
 	r.setElbowCutoff(len(results))
 
-	return results
+	// Return fatal error if any batch failed with unrecoverable error
+	if fatalErr != nil {
+		return nil, fatalErr
+	}
+
+	return results, nil
 }
 
 // perpendicularDistance calculates perpendicular distance from point to line
