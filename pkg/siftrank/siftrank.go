@@ -476,7 +476,7 @@ func ShortDeterministicID(input string, length int) string {
 }
 
 // RankFromFile ranks documents loaded from a file with optional template.
-func (r *Ranker) RankFromFile(filePath string, templateData string, forceJSON bool) ([]RankedDocument, error) {
+func (r *Ranker) RankFromFile(filePath string, templateData string, forceJSON bool) ([]*RankedDocument, error) {
 	documents, err := r.loadDocumentsFromFile(filePath, templateData, forceJSON)
 	if err != nil {
 		return nil, err
@@ -503,7 +503,7 @@ func (r *Ranker) RankFromFile(filePath string, templateData string, forceJSON bo
 // For text input, each line is treated as a document.
 // For JSON input (isJSON=true), expects a JSON array of objects.
 // templateData uses Go template syntax; for text input, use {{.Data}} to reference each line.
-func (r *Ranker) RankFromReader(reader io.Reader, templateData string, isJSON bool) ([]RankedDocument, error) {
+func (r *Ranker) RankFromReader(reader io.Reader, templateData string, isJSON bool) ([]*RankedDocument, error) {
 	documents, err := r.loadDocumentsFromReader(reader, templateData, isJSON)
 	if err != nil {
 		return nil, err
@@ -513,7 +513,7 @@ func (r *Ranker) RankFromReader(reader io.Reader, templateData string, isJSON bo
 }
 
 // rankDocuments performs the core ranking logic on a set of documents.
-func (r *Ranker) rankDocuments(documents []document) ([]RankedDocument, error) {
+func (r *Ranker) rankDocuments(documents []document) ([]*RankedDocument, error) {
 	// check that no document is too large
 	for _, doc := range documents {
 		tokens := r.estimateTokens([]document{doc}, true)
@@ -818,7 +818,7 @@ func (r *Ranker) loadJSONDocuments(reader io.Reader, tmpl *template.Template) ([
 }
 
 // perform the ranking algorithm on the given documents
-func (r *Ranker) rank(documents []document, round int) []RankedDocument {
+func (r *Ranker) rank(documents []document, round int) []*RankedDocument {
 	r.round = round
 
 	// Track original document count for exposure calculation
@@ -830,7 +830,7 @@ func (r *Ranker) rank(documents []document, round int) []RankedDocument {
 
 	// If we've narrowed down to a single document, we're done.
 	if len(documents) == 1 {
-		return []RankedDocument{
+		return []*RankedDocument{
 			{
 				Key:        documents[0].ID,
 				Value:      documents[0].Value,
@@ -1319,7 +1319,7 @@ func (r *Ranker) logFromApiCall(trialNum, batchNum int, message string, args ...
 	r.cfg.Logger.Debug(formattedMessage, "round", r.round, "trial", trialNum, "total_trials", r.cfg.NumTrials, "batch", batchNum, "total_batches", r.numBatches)
 }
 
-func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
+func (r *Ranker) shuffleBatchRank(documents []document) []*RankedDocument {
 	// Reset convergence state for this recursion level (round)
 	r.mu.Lock()
 	r.converged = false
@@ -1638,11 +1638,11 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 		finalScores[id] = sum / float64(len(scoreList))
 	}
 
-	var results []RankedDocument
+	var results []*RankedDocument
 	for id, score := range finalScores {
 		for _, doc := range documents {
 			if doc.ID == id {
-				results = append(results, RankedDocument{
+				results = append(results, &RankedDocument{
 					Key:        id,
 					Value:      doc.Value,
 					Document:   doc.Document,
