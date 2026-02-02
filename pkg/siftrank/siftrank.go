@@ -189,6 +189,7 @@ type docStats struct {
 	ID                string
 	Value             string
 	Document          interface{}
+	InputIndex        int      // Index in original input (0-based)
 	relevanceSnippets []string // Collected relevance from all batches/trials
 }
 
@@ -314,9 +315,10 @@ func (ranker *Ranker) adjustBatchSize(documents []document) error {
 }
 
 type document struct {
-	ID       string      `json:"id"`
-	Value    string      `json:"value"`    // to be ranked
-	Document interface{} `json:"document"` // if loading from json file
+	ID         string      `json:"id"`
+	Value      string      `json:"value"`    // to be ranked
+	Document   interface{} `json:"document"` // if loading from json file
+	InputIndex int         // Index in original input (0-based)
 }
 
 type rankedDocument struct {
@@ -352,14 +354,15 @@ type RelevanceProsCons struct {
 }
 
 type RankedDocument struct {
-	Key       string             `json:"key"`
-	Value     string             `json:"value"`
-	Document  interface{}        `json:"document"` // if loading from json file
-	Score     float64            `json:"score"`
-	Exposure  float64            `json:"exposure"` // percentage of dataset compared against (0.0-1.0)
-	Rank      int                `json:"rank"`
-	Rounds    int                `json:"rounds"`              // number of rounds participated in
-	Relevance *RelevanceProsCons `json:"relevance,omitempty"` // Only if relevance enabled
+	Key        string             `json:"key"`
+	Value      string             `json:"value"`
+	Document   interface{}        `json:"document"`    // if loading from json file
+	Score      float64            `json:"score"`
+	Exposure   float64            `json:"exposure"`    // percentage of dataset compared against (0.0-1.0)
+	Rank       int                `json:"rank"`
+	Rounds     int                `json:"rounds"`              // number of rounds participated in
+	Relevance  *RelevanceProsCons `json:"relevance,omitempty"` // Only if relevance enabled
+	InputIndex int                `json:"input_index"` // Index in original input (0-based)
 }
 
 type traceDocument struct {
@@ -588,6 +591,7 @@ func (r *Ranker) rankDocuments(documents []document) ([]RankedDocument, error) {
 				ID:                doc.ID,
 				Value:             doc.Value,
 				Document:          doc.Document,
+				InputIndex:        doc.InputIndex,
 				relevanceSnippets: []string{},
 			}
 		}
@@ -751,7 +755,7 @@ func (r *Ranker) loadTextDocuments(reader io.Reader, tmpl *template.Template) ([
 	var documents []document
 	lines := strings.Split(string(content), "\n")
 
-	for _, line := range lines {
+	for i, line := range lines {
 		line = strings.TrimRight(line, "\r") // Handle Windows line endings
 		if line == "" {
 			continue // Skip empty lines
@@ -766,7 +770,12 @@ func (r *Ranker) loadTextDocuments(reader io.Reader, tmpl *template.Template) ([
 		}
 
 		id := ShortDeterministicID(line, idLen)
-		documents = append(documents, document{ID: id, Document: nil, Value: line})
+		documents = append(documents, document{
+			ID:         id,
+			Document:   nil,
+			Value:      line,
+			InputIndex: i,
+		})
 	}
 
 	return documents, nil
@@ -779,7 +788,7 @@ func (r *Ranker) loadJSONDocuments(reader io.Reader, tmpl *template.Template) ([
 	}
 
 	var documents []document
-	for _, value := range data {
+	for i, value := range data {
 		var valueStr string
 		if tmpl != nil {
 			var tmplData bytes.Buffer
@@ -797,7 +806,12 @@ func (r *Ranker) loadJSONDocuments(reader io.Reader, tmpl *template.Template) ([
 		}
 
 		id := ShortDeterministicID(valueStr, idLen)
-		documents = append(documents, document{ID: id, Document: value, Value: valueStr})
+		documents = append(documents, document{
+			ID:         id,
+			Document:   value,
+			Value:      valueStr,
+			InputIndex: i,
+		})
 	}
 
 	return documents, nil
@@ -818,12 +832,13 @@ func (r *Ranker) rank(documents []document, round int) []RankedDocument {
 	if len(documents) == 1 {
 		return []RankedDocument{
 			{
-				Key:      documents[0].ID,
-				Value:    documents[0].Value,
-				Document: documents[0].Document,
-				Score:    0,   // 0 is guaranteed to be the "highest" score.
-				Exposure: 1.0, // 100% exposure (single document)
-				Rounds:   round,
+				Key:        documents[0].ID,
+				Value:      documents[0].Value,
+				Document:   documents[0].Document,
+				Score:      0,   // 0 is guaranteed to be the "highest" score.
+				Exposure:   1.0, // 100% exposure (single document)
+				Rounds:     round,
+				InputIndex: documents[0].InputIndex,
 			},
 		}
 	}
@@ -1628,12 +1643,13 @@ func (r *Ranker) shuffleBatchRank(documents []document) []RankedDocument {
 		for _, doc := range documents {
 			if doc.ID == id {
 				results = append(results, RankedDocument{
-					Key:      id,
-					Value:    doc.Value,
-					Document: doc.Document,
-					Score:    score,
-					Exposure: 0.0, // Will be calculated at the end in RankFromFile
-					Rounds:   r.round,
+					Key:        id,
+					Value:      doc.Value,
+					Document:   doc.Document,
+					Score:      score,
+					Exposure:   0.0, // Will be calculated at the end in RankFromFile
+					Rounds:     r.round,
+					InputIndex: doc.InputIndex,
 				})
 				break
 			}
