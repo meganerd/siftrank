@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
+	"github.com/noperator/siftrank/pkg/siftrank/eval"
 	"github.com/openai/openai-go"
 )
 
@@ -193,6 +194,10 @@ type Config struct {
 	OpenAIKey    string           `json:"-"`            // API key (required if LLMProvider is nil)
 	OpenAIAPIURL string           `json:"-"`            // Base URL (for compatible APIs like vLLM)
 
+	// CompareModels enables model comparison mode (format: "provider:model,provider:model")
+	// When set, rotates between models and collects performance metrics
+	CompareModels string `json:"-"`
+
 	// Encoding is the tokenizer encoding name (e.g., "o200k_base").
 	// Used only by the default OpenAI provider for accurate token counting.
 	// Custom LLMProvider implementations can ignore this field.
@@ -298,6 +303,9 @@ type Ranker struct {
 	totalBatches int
 	totalTrials  int
 	totalRounds  int
+
+	// Model evaluation (optional, only set when CompareModels is used)
+	metricsCollector *eval.MetricsCollector
 }
 
 func NewRanker(config *Config) (*Ranker, error) {
@@ -315,19 +323,33 @@ func NewRanker(config *Config) (*Ranker, error) {
 
 	// Create provider (default to OpenAI if none specified)
 	provider := config.LLMProvider
+	var metricsCollector *eval.MetricsCollector
+
 	if provider == nil {
-		var err error
-		provider, err = NewProvider(ProviderConfig{
-			Type:     ProviderTypeOpenAI,
-			APIKey:   config.OpenAIKey,
-			Model:    string(config.OpenAIModel),
-			BaseURL:  config.OpenAIAPIURL,
-			Encoding: config.Encoding,
-			Effort:   config.Effort,
-			Logger:   config.Logger,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to create provider: %w", err)
+		// Check if CompareModels is set
+		if config.CompareModels != "" {
+			// Create EvalProvider for model comparison
+			var err error
+			provider, metricsCollector, err = NewEvalProvider(config.CompareModels, config.Logger)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create eval provider: %w", err)
+			}
+			config.Logger.Info("model comparison enabled", "models", config.CompareModels)
+		} else {
+			// Create default OpenAI provider
+			var err error
+			provider, err = NewProvider(ProviderConfig{
+				Type:     ProviderTypeOpenAI,
+				APIKey:   config.OpenAIKey,
+				Model:    string(config.OpenAIModel),
+				BaseURL:  config.OpenAIAPIURL,
+				Encoding: config.Encoding,
+				Effort:   config.Effort,
+				Logger:   config.Logger,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to create provider: %w", err)
+			}
 		}
 	}
 
@@ -339,8 +361,9 @@ func NewRanker(config *Config) (*Ranker, error) {
 	seed := int64(binary.BigEndian.Uint64(seedBytes[:])) // #nosec G115 - overflow is acceptable for RNG seed
 
 	return &Ranker{
-		cfg:      config,
-		provider: provider,
+		cfg:              config,
+		provider:         provider,
+		metricsCollector: metricsCollector,
 		// #nosec G404 - Using math/rand seeded with crypto/rand for shuffling (not security-critical)
 		rng:       rand.New(rand.NewSource(seed)),
 		semaphore: make(chan struct{}, config.Concurrency),
@@ -471,6 +494,27 @@ type traceLine struct {
 	ElbowPosition     *int            `json:"elbow_position,omitempty"`      // nil if not detected
 	StableTrialsCount int             `json:"stable_trials_count,omitempty"` // only if convergence enabled
 	Rankings          []traceDocument `json:"rankings"`
+}
+
+// modelPerfEvent is written to trace.jsonl when model comparison is enabled
+type modelPerfEvent struct {
+	EventType string            `json:"event_type"` // Always "model_perf"
+	Round     int               `json:"round"`
+	Trial     int               `json:"trial"`
+	Models    []modelPerfDetail `json:"models"`
+}
+
+// modelPerfDetail contains performance statistics for a single model
+type modelPerfDetail struct {
+	ModelID     string  `json:"model_id"`
+	CallCount   int     `json:"call_count"`
+	SuccessRate float64 `json:"success_rate"`
+	ErrorCount  int     `json:"error_count"`
+	AvgLatency  int64   `json:"avg_latency_ms"`
+	P50Latency  int64   `json:"p50_latency_ms"`
+	P95Latency  int64   `json:"p95_latency_ms"`
+	P99Latency  int64   `json:"p99_latency_ms"`
+	TotalTokens int     `json:"total_tokens"`
 }
 
 // createIDMappings generates memorable temporary IDs for a batch of documents
@@ -1117,6 +1161,65 @@ Example: {"pros": "Strong connection to X. References Y explicitly.", "cons": "L
 	return &result, opts.Usage, nil
 }
 
+// recordModelPerformance writes model performance metrics to trace file
+func (r *Ranker) recordModelPerformance(round int, trial int) error {
+	// Early exit if no trace file or no metrics collector
+	if r.traceFile == nil || r.metricsCollector == nil {
+		return nil
+	}
+
+	// Get all metrics from collector
+	allMetrics := r.metricsCollector.GetMetrics()
+	if len(allMetrics) == 0 {
+		return nil // No metrics to record yet
+	}
+
+	// Aggregate metrics by model
+	aggregator := eval.NewSessionAggregator()
+	modelStats := aggregator.AggregateByModel(allMetrics)
+
+	// Convert to trace format
+	details := make([]modelPerfDetail, 0, len(modelStats))
+	for _, stats := range modelStats {
+		details = append(details, modelPerfDetail{
+			ModelID:     stats.ModelID,
+			CallCount:   stats.CallCount,
+			SuccessRate: stats.SuccessRate,
+			ErrorCount:  stats.ErrorCount,
+			AvgLatency:  stats.AvgLatency,
+			P50Latency:  stats.P50Latency,
+			P95Latency:  stats.P95Latency,
+			P99Latency:  stats.P99Latency,
+			TotalTokens: stats.TotalTokens,
+		})
+	}
+
+	// Create model perf event
+	event := modelPerfEvent{
+		EventType: "model_perf",
+		Round:     round,
+		Trial:     trial,
+		Models:    details,
+	}
+
+	// Write to trace file
+	data, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("failed to marshal model perf event: %w", err)
+	}
+
+	if _, err := r.traceFile.Write(append(data, '\n')); err != nil {
+		return fmt.Errorf("failed to write model perf event: %w", err)
+	}
+
+	// Flush to disk immediately
+	if err := r.traceFile.Sync(); err != nil {
+		return fmt.Errorf("failed to sync trace file: %w", err)
+	}
+
+	return nil
+}
+
 func (r *Ranker) recordTrialState(trialNum int, trialsCompleted int, scores map[string][]float64, documents []document) error {
 	// Early exit if neither feature is enabled
 	if r.traceFile == nil && !r.cfg.Watch {
@@ -1721,6 +1824,11 @@ func (r *Ranker) shuffleBatchRank(documents []document) ([]*RankedDocument, erro
 			// Record trial state with cumulative scores from trials 1..N only
 			if err := r.recordTrialState(completedTrialsCount, completedTrialsCount, cumulativeScores, documents); err != nil {
 				r.cfg.Logger.Error("Failed to record trial state", "error", err)
+			}
+
+			// Record model performance metrics if comparison is enabled
+			if err := r.recordModelPerformance(r.round, completedTrialsCount); err != nil {
+				r.cfg.Logger.Error("Failed to record model performance", "error", err)
 			}
 
 			// Signal workers to stop if converged
