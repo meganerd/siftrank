@@ -44,6 +44,18 @@ func (t *customTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
+// authTransport applies authentication strategy to HTTP requests
+type authTransport struct {
+	Transport http.RoundTripper
+	Auth      AuthStrategy
+}
+
+func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Apply authentication before forwarding to next transport
+	t.Auth.ApplyAuth(req)
+	return t.Transport.RoundTrip(req)
+}
+
 // OpenAIProvider implements LLMProvider using OpenAI API
 type OpenAIProvider struct {
 	client    *openai.Client
@@ -56,7 +68,7 @@ type OpenAIProvider struct {
 
 // OpenAIConfig configures the OpenAI provider
 type OpenAIConfig struct {
-	APIKey   string
+	Auth     AuthStrategy     // Authentication strategy (BearerAuth for OpenAI/OpenRouter, HeaderAuth for custom)
 	Model    openai.ChatModel
 	BaseURL  string // Optional: for vLLM, OpenRouter, etc.
 	Encoding string // Tokenizer encoding
@@ -72,13 +84,16 @@ func NewOpenAIProvider(cfg OpenAIConfig) (*OpenAIProvider, error) {
 		return nil, fmt.Errorf("failed to get tiktoken encoding: %w", err)
 	}
 
-	// Create custom transport for rate limit handling
-	transport := &customTransport{Transport: http.DefaultTransport}
-	httpClient := &http.Client{Transport: transport}
+	// Create transport chain: auth -> custom (rate limit handling) -> default
+	customTransport := &customTransport{Transport: http.DefaultTransport}
+	authTransport := &authTransport{
+		Transport: customTransport,
+		Auth:      cfg.Auth,
+	}
+	httpClient := &http.Client{Transport: authTransport}
 
-	// Create OpenAI client
+	// Create OpenAI client (auth applied via transport, not WithAPIKey)
 	clientOptions := []option.RequestOption{
-		option.WithAPIKey(cfg.APIKey),
 		option.WithHTTPClient(httpClient),
 		option.WithMaxRetries(5),
 	}
@@ -99,7 +114,7 @@ func NewOpenAIProvider(cfg OpenAIConfig) (*OpenAIProvider, error) {
 		effort:    cfg.Effort,
 		logger:    cfg.Logger,
 		encoding:  encoding,
-		transport: transport,
+		transport: customTransport,
 	}, nil
 }
 
