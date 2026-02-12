@@ -65,7 +65,7 @@ func NewProvider(cfg ProviderConfig) (LLMProvider, error) {
 	case ProviderTypeOpenAI, ProviderTypeOpenRouter:
 		return newOpenAICompatibleProvider(cfg, logger)
 	case ProviderTypeAnthropic:
-		return nil, fmt.Errorf("anthropic provider not yet implemented")
+		return newAnthropicProvider(cfg, logger)
 	case ProviderTypeGoogle:
 		return nil, fmt.Errorf("google provider not yet implemented")
 	case ProviderTypeOllama:
@@ -95,6 +95,28 @@ func newOpenAICompatibleProvider(cfg ProviderConfig, logger *slog.Logger) (LLMPr
 		BaseURL:  cfg.BaseURL,
 		Encoding: encoding,
 		Effort:   cfg.Effort,
+		Logger:   logger,
+	})
+}
+
+// newAnthropicProvider creates a provider for Anthropic
+func newAnthropicProvider(cfg ProviderConfig, logger *slog.Logger) (LLMProvider, error) {
+	// Anthropic uses x-api-key header authentication
+	if cfg.APIKey == "" {
+		return nil, fmt.Errorf("anthropic provider requires an API key")
+	}
+
+	// Default encoding for Anthropic (cl100k_base works well for Claude)
+	encoding := cfg.Encoding
+	if encoding == "" {
+		encoding = DefaultEncoding
+	}
+
+	return NewAnthropicProvider(AnthropicConfig{
+		Auth:     NewHeaderAuth("x-api-key", cfg.APIKey),
+		Model:    cfg.Model,
+		BaseURL:  cfg.BaseURL,
+		Encoding: encoding,
 		Logger:   logger,
 	})
 }
@@ -260,7 +282,7 @@ func NewEvalProvider(compareModels string, logger *slog.Logger) (LLMProvider, *e
 				baseURL = "http://localhost:11434"
 			}
 		case ProviderTypeAnthropic:
-			return nil, nil, fmt.Errorf("anthropic provider not yet implemented")
+			apiKey = os.Getenv("ANTHROPIC_API_KEY")
 		case ProviderTypeGoogle:
 			return nil, nil, fmt.Errorf("google provider not yet implemented")
 		default:
