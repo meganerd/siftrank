@@ -146,14 +146,57 @@ func TestNewProvider_OllamaMissingBaseURL(t *testing.T) {
 
 func TestNewProvider_UnimplementedProvider(t *testing.T) {
 	cfg := ProviderConfig{
-		Type:     ProviderTypeAnthropic,
+		Type:     ProviderTypeGoogle,
 		APIKey:   "test-key",
-		Model:    "claude-3-opus",
+		Model:    "gemini-pro",
 		Encoding: "o200k_base",
 	}
 
 	_, err := NewProvider(cfg)
 	if err == nil {
-		t.Fatal("Expected error for unimplemented Anthropic provider")
+		t.Fatal("Expected error for unimplemented Google provider")
+	}
+}
+
+func TestNewProvider_Anthropic(t *testing.T) {
+	cfg := ProviderConfig{
+		Type:     ProviderTypeAnthropic,
+		APIKey:   "test-key",
+		Model:    "claude-3-5-sonnet-20241022",
+		Encoding: "cl100k_base",
+	}
+
+	provider, err := NewProvider(cfg)
+	if err != nil {
+		t.Fatalf("NewProvider failed: %v", err)
+	}
+
+	if provider == nil {
+		t.Fatal("Expected non-nil provider")
+	}
+
+	// Verify it implements LLMProvider
+	_, ok := provider.(LLMProvider)
+	if !ok {
+		t.Fatal("Provider does not implement LLMProvider interface")
+	}
+
+	// Verify it implements TokenEstimator (Anthropic provider should)
+	_, ok = provider.(TokenEstimator)
+	if !ok {
+		t.Fatal("Anthropic provider should implement TokenEstimator interface")
+	}
+}
+
+func TestNewProvider_Anthropic_MissingAPIKey(t *testing.T) {
+	cfg := ProviderConfig{
+		Type:     ProviderTypeAnthropic,
+		Model:    "claude-3-5-sonnet-20241022",
+		Encoding: "cl100k_base",
+	}
+
+	_, err := NewProvider(cfg)
+	if err == nil {
+		t.Fatal("Expected error for missing API key")
 	}
 }
