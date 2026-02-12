@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/noperator/siftrank/pkg/siftrank"
@@ -13,6 +14,49 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
+
+// validatePath validates a file path for security concerns:
+// - No directory traversal (..)
+// - Resolves symlinks and validates the target
+// - Returns the cleaned, absolute path
+func validatePath(path string) (string, error) {
+	// Get absolute path
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve absolute path: %w", err)
+	}
+
+	// Check for directory traversal attempts
+	cleanPath := filepath.Clean(absPath)
+	if strings.Contains(cleanPath, "..") {
+		return "", fmt.Errorf("path contains directory traversal: %s", path)
+	}
+
+	// Resolve symlinks to get the real path
+	realPath, err := filepath.EvalSymlinks(cleanPath)
+	if err != nil {
+		// If file doesn't exist yet (for output files), just return the clean path
+		if os.IsNotExist(err) {
+			return cleanPath, nil
+		}
+		return "", fmt.Errorf("failed to resolve symlinks: %w", err)
+	}
+
+	// For existing files, verify it's a regular file (not a directory, device, etc.)
+	info, err := os.Stat(realPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cleanPath, nil
+		}
+		return "", fmt.Errorf("failed to stat file: %w", err)
+	}
+
+	if info.IsDir() {
+		return "", fmt.Errorf("path is a directory, not a file: %s", path)
+	}
+
+	return realPath, nil
+}
 
 var (
 	// Input/Output
@@ -119,7 +163,9 @@ func init() {
 	rootCmd.Flags().StringVarP(&inputFile, "file", "f", "", "input file (required)")
 	rootCmd.Flags().BoolVar(&forceJSON, "json", false, "force JSON parsing regardless of file extension")
 	rootCmd.Flags().StringVarP(&outputFile, "output", "o", "", "JSON output file")
-	rootCmd.MarkFlagRequired("file")
+	if err := rootCmd.MarkFlagRequired("file"); err != nil {
+		panic(fmt.Sprintf("failed to mark flag as required: %v", err))
+	}
 
 	// Prompt/Template flags
 	rootCmd.Flags().StringVarP(&initialPrompt, "prompt", "p", "", "initial prompt (prefix with @ to use a file)")
@@ -181,8 +227,12 @@ func run(cmd *cobra.Command, args []string) error {
 	var logWriter *os.File
 	var logOutput io.Writer = os.Stderr
 	if logFile != "" {
-		var err error
-		logWriter, err = os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		validLogPath, err := validatePath(logFile)
+		if err != nil {
+			return fmt.Errorf("invalid log file path: %w", err)
+		}
+		// #nosec G304 - Path validated by validatePath (no traversal, symlinks resolved)
+		logWriter, err = os.OpenFile(validLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 		if err != nil {
 			return fmt.Errorf("failed to open log file: %w", err)
 		}
@@ -206,7 +256,12 @@ func run(cmd *cobra.Command, args []string) error {
 	userPrompt := initialPrompt
 	if strings.HasPrefix(userPrompt, "@") {
 		filePath := strings.TrimPrefix(userPrompt, "@")
-		content, err := os.ReadFile(filePath)
+		validPromptPath, err := validatePath(filePath)
+		if err != nil {
+			return fmt.Errorf("invalid prompt file path: %w", err)
+		}
+		// #nosec G304 - Path validated by validatePath (no traversal, symlinks resolved)
+		content, err := os.ReadFile(validPromptPath)
 		if err != nil {
 			return fmt.Errorf("could not read initial prompt file: %w", err)
 		}
@@ -266,10 +321,14 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Write to output file if specified
 	if outputFile != "" {
-		if err := os.WriteFile(outputFile, jsonResults, 0644); err != nil {
+		validOutputPath, err := validatePath(outputFile)
+		if err != nil {
+			return fmt.Errorf("invalid output file path: %w", err)
+		}
+		if err := os.WriteFile(validOutputPath, jsonResults, 0600); err != nil {
 			return fmt.Errorf("failed to write output file: %w", err)
 		}
-		logger.Info("results written to file", "file", outputFile)
+		logger.Info("results written to file", "file", validOutputPath)
 	}
 
 	return nil

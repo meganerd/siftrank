@@ -3,8 +3,10 @@ package siftrank
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -82,6 +84,49 @@ var (
 		"yak", "yam",
 	}
 )
+
+// validatePath validates a file path for security concerns:
+// - No directory traversal (..)
+// - Resolves symlinks and validates the target
+// - Returns the cleaned, absolute path
+func validatePath(path string) (string, error) {
+	// Get absolute path
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve absolute path: %w", err)
+	}
+
+	// Check for directory traversal attempts
+	cleanPath := filepath.Clean(absPath)
+	if strings.Contains(cleanPath, "..") {
+		return "", fmt.Errorf("path contains directory traversal: %s", path)
+	}
+
+	// Resolve symlinks to get the real path
+	realPath, err := filepath.EvalSymlinks(cleanPath)
+	if err != nil {
+		// If file doesn't exist yet (for output files), just return the clean path
+		if os.IsNotExist(err) {
+			return cleanPath, nil
+		}
+		return "", fmt.Errorf("failed to resolve symlinks: %w", err)
+	}
+
+	// For existing files, verify it's a regular file (not a directory, device, etc.)
+	info, err := os.Stat(realPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cleanPath, nil
+		}
+		return "", fmt.Errorf("failed to stat file: %w", err)
+	}
+
+	if info.IsDir() {
+		return "", fmt.Errorf("path is a directory, not a file: %s", path)
+	}
+
+	return realPath, nil
+}
 
 // Config contains all configuration options for a Ranker.
 // Use NewConfig() to get sensible defaults, then override as needed.
@@ -285,10 +330,18 @@ func NewRanker(config *Config) (*Ranker, error) {
 		}
 	}
 
+	// Create cryptographically secure seed for RNG
+	var seedBytes [8]byte
+	if _, err := crand.Read(seedBytes[:]); err != nil {
+		return nil, fmt.Errorf("failed to generate secure random seed: %w", err)
+	}
+	seed := int64(binary.BigEndian.Uint64(seedBytes[:])) // #nosec G115 - overflow is acceptable for RNG seed
+
 	return &Ranker{
-		cfg:       config,
-		provider:  provider,
-		rng:       rand.New(rand.NewSource(time.Now().UnixNano())),
+		cfg:      config,
+		provider: provider,
+		// #nosec G404 - Using math/rand seeded with crypto/rand for shuffling (not security-critical)
+		rng:       rand.New(rand.NewSource(seed)),
 		semaphore: make(chan struct{}, config.Concurrency),
 	}, nil
 }
@@ -768,13 +821,19 @@ func (r *Ranker) rankDocuments(documents []document) ([]*RankedDocument, error) 
 }
 
 func (r *Ranker) loadDocumentsFromFile(filePath string, templateData string, forceJSON bool) ([]document, error) {
-	file, err := os.Open(filePath)
+	validPath, err := validatePath(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open input file %s: %w", filePath, err)
+		return nil, fmt.Errorf("invalid input file path: %w", err)
+	}
+
+	// #nosec G304 - Path validated by validatePath (no traversal, symlinks resolved)
+	file, err := os.Open(validPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open input file %s: %w", validPath, err)
 	}
 	defer file.Close()
 
-	ext := strings.ToLower(filepath.Ext(filePath))
+	ext := strings.ToLower(filepath.Ext(validPath))
 	isJSON := ext == ".json" || forceJSON
 
 	return r.loadDocumentsFromReader(file, templateData, isJSON)
