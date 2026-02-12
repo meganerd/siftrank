@@ -76,10 +76,11 @@ var (
 	refinementRatio float64
 
 	// Model params
-	oaiModel string
-	oaiURL   string
-	encoding string
-	effort   string
+	oaiModel      string
+	oaiURL        string
+	encoding      string
+	effort        string
+	compareModels string
 
 	// Convergence params
 	noConverge     bool
@@ -183,6 +184,7 @@ func init() {
 	rootCmd.Flags().StringVarP(&oaiURL, "base-url", "u", "", "OpenAI API base URL (for compatible APIs like vLLM)")
 	rootCmd.Flags().StringVar(&encoding, "encoding", siftrank.DefaultEncoding, "tokenizer encoding")
 	rootCmd.Flags().StringVarP(&effort, "effort", "e", "", "reasoning effort level: none, minimal, low, medium, high")
+	rootCmd.Flags().StringVar(&compareModels, "compare", "", "compare multiple models (format: \"provider:model,provider:model\")")
 
 	// Convergence parameter flags
 	rootCmd.Flags().BoolVar(&noConverge, "no-converge", false, "disable early stopping based on convergence")
@@ -211,7 +213,7 @@ func init() {
 	rootCmd.SetUsageTemplate(usageTemplate)
 
 	// Organize flags into groups
-	setFlagGroup(rootCmd, "options", "file", "prompt", "output", "model", "relevance")
+	setFlagGroup(rootCmd, "options", "file", "prompt", "output", "model", "relevance", "compare")
 	setFlagGroup(rootCmd, "visualization", "watch", "no-minimap")
 	setFlagGroup(rootCmd, "debug", "trace", "debug", "dry-run", "log")
 	setFlagGroup(rootCmd, "advanced", "template", "json", "base-url", "encoding", "effort", "tokens", "batch-size", "max-trials", "concurrency", "ratio", "no-converge", "elbow-tolerance", "stable-trials", "min-trials", "elbow-method")
@@ -284,10 +286,11 @@ func run(cmd *cobra.Command, args []string) error {
 		TracePath:       traceFile,
 		Relevance:       relevance,
 		Effort:          effort,
-		LogLevel:  logLevel,
-		Logger:    logger,
-		Watch:     watch,
-		NoMinimap: noMinimap,
+		CompareModels:   compareModels,
+		LogLevel:        logLevel,
+		Logger:          logger,
+		Watch:           watch,
+		NoMinimap:       noMinimap,
 
 		EnableConvergence: !noConverge,
 		ElbowTolerance:    elbowTolerance,
