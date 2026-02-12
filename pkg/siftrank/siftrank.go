@@ -318,7 +318,7 @@ func NewRanker(config *Config) (*Ranker, error) {
 	if provider == nil {
 		var err error
 		provider, err = NewOpenAIProvider(OpenAIConfig{
-			APIKey:   config.OpenAIKey,
+			Auth:     NewBearerAuth(config.OpenAIKey),
 			Model:    config.OpenAIModel,
 			BaseURL:  config.OpenAIAPIURL,
 			Encoding: config.Encoding,
