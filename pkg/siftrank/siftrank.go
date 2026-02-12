@@ -317,16 +317,17 @@ func NewRanker(config *Config) (*Ranker, error) {
 	provider := config.LLMProvider
 	if provider == nil {
 		var err error
-		provider, err = NewOpenAIProvider(OpenAIConfig{
-			Auth:     NewBearerAuth(config.OpenAIKey),
-			Model:    config.OpenAIModel,
+		provider, err = NewProvider(ProviderConfig{
+			Type:     ProviderTypeOpenAI,
+			APIKey:   config.OpenAIKey,
+			Model:    string(config.OpenAIModel),
 			BaseURL:  config.OpenAIAPIURL,
 			Encoding: config.Encoding,
 			Effort:   config.Effort,
 			Logger:   config.Logger,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to create OpenAI provider: %w", err)
+			return nil, fmt.Errorf("failed to create provider: %w", err)
 		}
 	}
 
