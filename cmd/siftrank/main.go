@@ -7,12 +7,19 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/noperator/siftrank/pkg/siftrank"
 	"github.com/openai/openai-go"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+)
+
+const (
+	// MaxFilesPerDirectory limits the number of files that can be enumerated
+	// from a directory to prevent resource exhaustion attacks
+	MaxFilesPerDirectory = 1000
 )
 
 // validatePath validates a file path for security concerns:
@@ -58,11 +65,83 @@ func validatePath(path string) (string, error) {
 	return realPath, nil
 }
 
+// validateInputPath validates a file or directory path
+// Returns: (path, isDir, error)
+func validateInputPath(path string) (string, bool, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to resolve absolute path: %w", err)
+	}
+
+	cleanPath := filepath.Clean(absPath)
+	if strings.Contains(cleanPath, "..") {
+		return "", false, fmt.Errorf("path contains directory traversal: %s", path)
+	}
+
+	realPath, err := filepath.EvalSymlinks(cleanPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false, fmt.Errorf("path does not exist: %s", path)
+		}
+		return "", false, fmt.Errorf("failed to resolve symlinks: %w", err)
+	}
+
+	info, err := os.Stat(realPath)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to stat path: %w", err)
+	}
+
+	return realPath, info.IsDir(), nil
+}
+
+// enumerateFiles returns all files in directory matching glob pattern
+// Returns absolute paths of regular files only (skips subdirectories)
+func enumerateFiles(dirPath string, pattern string) ([]string, error) {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read directory: %w", err)
+	}
+
+	var matchedFiles []string
+	for _, entry := range entries {
+		// Skip subdirectories
+		if entry.IsDir() {
+			continue
+		}
+
+		// Check if file matches glob pattern
+		matched, err := filepath.Match(pattern, entry.Name())
+		if err != nil {
+			return nil, fmt.Errorf("invalid glob pattern %q: %w", pattern, err)
+		}
+
+		if matched {
+			fullPath := filepath.Join(dirPath, entry.Name())
+			matchedFiles = append(matchedFiles, fullPath)
+		}
+	}
+
+	// Check file count limit to prevent resource exhaustion
+	if len(matchedFiles) > MaxFilesPerDirectory {
+		return nil, fmt.Errorf("directory contains too many matching files (max %d)", MaxFilesPerDirectory)
+	}
+
+	// Sort for deterministic ordering
+	sort.Strings(matchedFiles)
+
+	if len(matchedFiles) == 0 {
+		return nil, fmt.Errorf("no files matched pattern %q in directory %s", pattern, dirPath)
+	}
+
+	return matchedFiles, nil
+}
+
 var (
 	// Input/Output
-	inputFile  string
-	forceJSON  bool
-	outputFile string
+	inputFile   string
+	forceJSON   bool
+	outputFile  string
+	filePattern string
 
 	// Prompt/Template
 	initialPrompt string
@@ -164,6 +243,7 @@ func init() {
 	rootCmd.Flags().StringVarP(&inputFile, "file", "f", "", "input file (required)")
 	rootCmd.Flags().BoolVar(&forceJSON, "json", false, "force JSON parsing regardless of file extension")
 	rootCmd.Flags().StringVarP(&outputFile, "output", "o", "", "JSON output file")
+	rootCmd.Flags().StringVar(&filePattern, "pattern", "*", "glob pattern for filtering files in directory (e.g., \"*.json\", \"data_*.txt\")")
 	if err := rootCmd.MarkFlagRequired("file"); err != nil {
 		panic(fmt.Sprintf("failed to mark flag as required: %v", err))
 	}
@@ -213,7 +293,7 @@ func init() {
 	rootCmd.SetUsageTemplate(usageTemplate)
 
 	// Organize flags into groups
-	setFlagGroup(rootCmd, "options", "file", "prompt", "output", "model", "relevance", "compare")
+	setFlagGroup(rootCmd, "options", "file", "prompt", "output", "model", "relevance", "compare", "pattern")
 	setFlagGroup(rootCmd, "visualization", "watch", "no-minimap")
 	setFlagGroup(rootCmd, "debug", "trace", "debug", "dry-run", "log")
 	setFlagGroup(rootCmd, "advanced", "template", "json", "base-url", "encoding", "effort", "tokens", "batch-size", "max-trials", "concurrency", "ratio", "no-converge", "elbow-tolerance", "stable-trials", "min-trials", "elbow-method")
@@ -305,10 +385,35 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create ranker: %w", err)
 	}
 
-	// Rank documents
-	finalResults, err := ranker.RankFromFile(inputFile, inputTemplate, forceJSON)
+	var finalResults []*siftrank.RankedDocument
+
+	// Validate input path (file or directory)
+	validPath, isDir, err := validateInputPath(inputFile)
 	if err != nil {
-		return fmt.Errorf("failed to rank from file: %w", err)
+		return fmt.Errorf("invalid input path: %w", err)
+	}
+
+	if isDir {
+		// Directory input: enumerate files with pattern
+		logger.Info("processing directory", "path", validPath, "pattern", filePattern)
+
+		filePaths, err := enumerateFiles(validPath, filePattern)
+		if err != nil {
+			return fmt.Errorf("failed to enumerate files: %w", err)
+		}
+
+		logger.Info("files discovered", "count", len(filePaths))
+
+		finalResults, err = ranker.RankFromFiles(filePaths, inputTemplate, forceJSON)
+		if err != nil {
+			return fmt.Errorf("failed to rank from directory: %w", err)
+		}
+	} else {
+		// File input: use existing path
+		finalResults, err = ranker.RankFromFile(validPath, inputTemplate, forceJSON)
+		if err != nil {
+			return fmt.Errorf("failed to rank from file: %w", err)
+		}
 	}
 
 	// Marshal results to JSON

@@ -3,6 +3,7 @@ package siftrank
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/openai/openai-go"
@@ -305,5 +306,133 @@ func TestRankFromFile_Errors(t *testing.T) {
 	_, err = ranker.RankFromFile(testFile, "{{.InvalidField | badFunc}}", false)
 	if err == nil {
 		t.Error("RankFromFile() with invalid template should return error")
+	}
+}
+
+// TestRankFromFiles_MultipleTextFiles tests directory input with multiple .txt files
+func TestRankFromFiles_MultipleTextFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create 3 text files
+	file1 := filepath.Join(tmpDir, "file1.txt")
+	file2 := filepath.Join(tmpDir, "file2.txt")
+	file3 := filepath.Join(tmpDir, "file3.txt")
+
+	if err := os.WriteFile(file1, []byte("apple\nbanana"), 0600); err != nil {
+		t.Fatalf("Failed to create file1: %v", err)
+	}
+	if err := os.WriteFile(file2, []byte("cherry\ndate"), 0600); err != nil {
+		t.Fatalf("Failed to create file2: %v", err)
+	}
+	if err := os.WriteFile(file3, []byte("elderberry"), 0600); err != nil {
+		t.Fatalf("Failed to create file3: %v", err)
+	}
+
+	config := &Config{
+		InitialPrompt:   "Sort alphabetically",
+		BatchSize:       5,
+		NumTrials:       1,
+		Concurrency:     20,
+		OpenAIModel:     openai.ChatModelGPT4oMini,
+		RefinementRatio: 0.0,
+		OpenAIKey:       "test-key",
+		Encoding:        "o200k_base",
+		BatchTokens:     2000,
+		DryRun:          true,
+	}
+
+	ranker, err := NewRanker(config)
+	if err != nil {
+		t.Fatalf("NewRanker() unexpected error: %v", err)
+	}
+
+	filePaths := []string{file1, file2, file3}
+	results, err := ranker.RankFromFiles(filePaths, "{{.Data}}", false)
+	if err != nil {
+		t.Fatalf("RankFromFiles() unexpected error: %v", err)
+	}
+
+	// 5 total documents: apple, banana, cherry, date, elderberry
+	if len(results) != 5 {
+		t.Errorf("RankFromFiles() expected 5 results, got %d", len(results))
+	}
+}
+
+// TestRankFromFiles_MixedJSON tests JSON files aggregation
+func TestRankFromFiles_MixedJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create 2 JSON files
+	file1 := filepath.Join(tmpDir, "data1.json")
+	file2 := filepath.Join(tmpDir, "data2.json")
+
+	json1 := `[{"id": 1, "text": "first"}, {"id": 2, "text": "second"}]`
+	json2 := `[{"id": 3, "text": "third"}]`
+
+	if err := os.WriteFile(file1, []byte(json1), 0600); err != nil {
+		t.Fatalf("Failed to create file1: %v", err)
+	}
+	if err := os.WriteFile(file2, []byte(json2), 0600); err != nil {
+		t.Fatalf("Failed to create file2: %v", err)
+	}
+
+	config := &Config{
+		InitialPrompt:   "Rank by id",
+		BatchSize:       5,
+		NumTrials:       1,
+		Concurrency:     20,
+		OpenAIModel:     openai.ChatModelGPT4oMini,
+		RefinementRatio: 0.0,
+		OpenAIKey:       "test-key",
+		Encoding:        "o200k_base",
+		BatchTokens:     2000,
+		DryRun:          true,
+	}
+
+	ranker, err := NewRanker(config)
+	if err != nil {
+		t.Fatalf("NewRanker() unexpected error: %v", err)
+	}
+
+	// Use proper template for JSON objects with "text" field
+	results, err := ranker.RankFromFiles([]string{file1, file2}, "{{.text}}", false)
+	if err != nil {
+		t.Fatalf("RankFromFiles() unexpected error: %v", err)
+	}
+
+	// 3 total documents from the JSON arrays
+	if len(results) != 3 {
+		t.Errorf("RankFromFiles() expected 3 results, got %d", len(results))
+	}
+}
+
+// TestRankFromFiles_EmptyDirectory tests no files provided
+func TestRankFromFiles_EmptyDirectory(t *testing.T) {
+	config := &Config{
+		InitialPrompt:   "test",
+		BatchSize:       5,
+		NumTrials:       1,
+		Concurrency:     20,
+		OpenAIModel:     openai.ChatModelGPT4oMini,
+		RefinementRatio: 0.0,
+		OpenAIKey:       "test-key",
+		Encoding:        "o200k_base",
+		BatchTokens:     2000,
+		DryRun:          true,
+	}
+
+	ranker, err := NewRanker(config)
+	if err != nil {
+		t.Fatalf("NewRanker() unexpected error: %v", err)
+	}
+
+	_, err = ranker.RankFromFiles([]string{}, "{{.Data}}", false)
+
+	if err == nil {
+		t.Error("RankFromFiles() with empty file list should return error")
+	}
+
+	if err != nil && !strings.Contains(err.Error(), "no documents loaded") {
+		t.Errorf("RankFromFiles() error should contain 'no documents loaded', got: %v", err)
 	}
 }
