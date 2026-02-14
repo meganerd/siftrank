@@ -30,13 +30,13 @@ func validatePath(path string) (string, error) {
 	// Get absolute path
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return "", fmt.Errorf("failed to resolve absolute path: %w", err)
+		return "", fmt.Errorf("failed to resolve path")
 	}
 
 	// Check for directory traversal attempts
 	cleanPath := filepath.Clean(absPath)
 	if strings.Contains(cleanPath, "..") {
-		return "", fmt.Errorf("path contains directory traversal: %s", path)
+		return "", fmt.Errorf("path contains directory traversal")
 	}
 
 	// Resolve symlinks to get the real path
@@ -46,7 +46,7 @@ func validatePath(path string) (string, error) {
 		if os.IsNotExist(err) {
 			return cleanPath, nil
 		}
-		return "", fmt.Errorf("failed to resolve symlinks: %w", err)
+		return "", fmt.Errorf("failed to resolve path")
 	}
 
 	// For existing files, verify it's a regular file (not a directory, device, etc.)
@@ -55,11 +55,11 @@ func validatePath(path string) (string, error) {
 		if os.IsNotExist(err) {
 			return cleanPath, nil
 		}
-		return "", fmt.Errorf("failed to stat file: %w", err)
+		return "", fmt.Errorf("failed to stat path")
 	}
 
 	if info.IsDir() {
-		return "", fmt.Errorf("path is a directory, not a file: %s", path)
+		return "", fmt.Errorf("path is a directory, not a file")
 	}
 
 	return realPath, nil
@@ -70,25 +70,25 @@ func validatePath(path string) (string, error) {
 func validateInputPath(path string) (string, bool, error) {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return "", false, fmt.Errorf("failed to resolve absolute path: %w", err)
+		return "", false, fmt.Errorf("failed to resolve path")
 	}
 
 	cleanPath := filepath.Clean(absPath)
 	if strings.Contains(cleanPath, "..") {
-		return "", false, fmt.Errorf("path contains directory traversal: %s", path)
+		return "", false, fmt.Errorf("path contains directory traversal")
 	}
 
 	realPath, err := filepath.EvalSymlinks(cleanPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", false, fmt.Errorf("path does not exist: %s", path)
+			return "", false, fmt.Errorf("path does not exist")
 		}
-		return "", false, fmt.Errorf("failed to resolve symlinks: %w", err)
+		return "", false, fmt.Errorf("failed to resolve path")
 	}
 
 	info, err := os.Stat(realPath)
 	if err != nil {
-		return "", false, fmt.Errorf("failed to stat path: %w", err)
+		return "", false, fmt.Errorf("failed to stat path")
 	}
 
 	return realPath, info.IsDir(), nil
@@ -99,7 +99,7 @@ func validateInputPath(path string) (string, bool, error) {
 func enumerateFiles(dirPath string, pattern string) ([]string, error) {
 	entries, err := os.ReadDir(dirPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read directory: %w", err)
+		return nil, fmt.Errorf("failed to read directory")
 	}
 
 	var matchedFiles []string
@@ -130,7 +130,7 @@ func enumerateFiles(dirPath string, pattern string) ([]string, error) {
 	sort.Strings(matchedFiles)
 
 	if len(matchedFiles) == 0 {
-		return nil, fmt.Errorf("no files matched pattern %q in directory %s", pattern, dirPath)
+		return nil, fmt.Errorf("no files matched pattern %q", pattern)
 	}
 
 	return matchedFiles, nil
