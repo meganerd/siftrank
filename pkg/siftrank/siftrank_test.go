@@ -1,6 +1,9 @@
 package siftrank
 
 import (
+	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -434,5 +437,98 @@ func TestRankFromFiles_EmptyDirectory(t *testing.T) {
 
 	if err != nil && !strings.Contains(err.Error(), "no documents loaded") {
 		t.Errorf("RankFromFiles() error should contain 'no documents loaded', got: %v", err)
+	}
+}
+
+// TestRankFromFiles_ExceedsDocumentLimit tests error when document count exceeds limit
+func TestRankFromFiles_ExceedsDocumentLimit(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create file with 10001 lines (exceeds MaxDocuments limit of 10000)
+	var lines []string
+	for i := 0; i < 10001; i++ {
+		lines = append(lines, fmt.Sprintf("document %d", i))
+	}
+
+	file1 := filepath.Join(tmpDir, "large.txt")
+	if err := os.WriteFile(file1, []byte(strings.Join(lines, "\n")), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	config := &Config{
+		InitialPrompt:   "test",
+		BatchSize:       5,
+		NumTrials:       1,
+		Concurrency:     20,
+		OpenAIModel:     openai.ChatModelGPT4oMini,
+		RefinementRatio: 0.0,
+		OpenAIKey:       "test-key",
+		Encoding:        "o200k_base",
+		BatchTokens:     2000,
+		DryRun:          true,
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		LogLevel:        slog.LevelInfo,
+	}
+
+	ranker, err := NewRanker(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = ranker.RankFromFiles([]string{file1}, "{{.Data}}", false)
+
+	if err == nil {
+		t.Fatal("Expected error for document count exceeding limit, got nil")
+	}
+
+	expectedMsg := "too many documents to rank (max 10000)"
+	if !strings.Contains(err.Error(), expectedMsg) {
+		t.Errorf("Expected error to contain %q, got: %v", expectedMsg, err)
+	}
+}
+
+// TestRankFromFiles_AtDocumentLimit tests success when document count equals limit
+func TestRankFromFiles_AtDocumentLimit(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create file with exactly 10000 lines (at MaxDocuments limit)
+	var lines []string
+	for i := 0; i < 10000; i++ {
+		lines = append(lines, fmt.Sprintf("document %d", i))
+	}
+
+	file1 := filepath.Join(tmpDir, "large.txt")
+	if err := os.WriteFile(file1, []byte(strings.Join(lines, "\n")), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	config := &Config{
+		InitialPrompt:   "test",
+		BatchSize:       5,
+		NumTrials:       1,
+		Concurrency:     20,
+		OpenAIModel:     openai.ChatModelGPT4oMini,
+		RefinementRatio: 0.0,
+		OpenAIKey:       "test-key",
+		Encoding:        "o200k_base",
+		BatchTokens:     2000,
+		DryRun:          true,
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		LogLevel:        slog.LevelInfo,
+	}
+
+	ranker, err := NewRanker(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := ranker.RankFromFiles([]string{file1}, "{{.Data}}", false)
+
+	if err != nil {
+		t.Fatalf("Expected success for document count at limit, got error: %v", err)
+	}
+
+	if len(results) != 10000 {
+		t.Errorf("Expected 10000 documents, got %d", len(results))
 	}
 }
