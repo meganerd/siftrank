@@ -9,10 +9,10 @@
 
 ## Description
 
-Got a bunch of data? Want to throw it at an LLM to find the most "interesting" stuff? If you simply YOLO your data into a ChatGPT session, you'll run into problems:
+Got a bunch of data? Want to use an LLM to find the most "interesting" stuff? If you simply paste your data into an LLM chat session, you'll run into problems:
 - Nondeterminism: Doesn't always respond with the same result
 - Limited context: Can't pass in all the data at once, need to break it up
-- Output contraints: Sometimes doesn't return all the data you asked it to review
+- Output constraints: Sometimes doesn't return all the data you asked it to review
 - Scoring subjectivity: Struggles to assign a consistent numeric score to an individual item
 
 `siftrank` is an implementation of the **Sift**Rank document ranking algorithm that uses LLMs to efficiently find the items in any dataset that are most relevant to a given prompt:
@@ -21,7 +21,19 @@ Got a bunch of data? Want to throw it at an LLM to find the most "interesting" s
 - **F**ixed: Caps the maximum number of LLM calls so the computational complexity remains linear in the worst case.
 - **T**rial: Repeatedly compares batched items until the relevance scores stabilize.
 
-Use LLMs to rank anything. No fine-tuning. No domain-specific models. Just an off-the-shelf model and your ranking prompt. Typically runs in seconds and costs pennies.
+Use any LLM to rank anything. No fine-tuning. No domain-specific models. Just an off-the-shelf model and your ranking prompt. Typically runs in seconds and costs pennies.
+
+### Supported Providers
+
+`siftrank` is **provider-agnostic** and works with multiple LLM providers:
+
+- **OpenAI** - GPT-4, GPT-4o, GPT-4o-mini (via `OPENAI_API_KEY`)
+- **Anthropic** - Claude Opus, Claude Sonnet, Claude Haiku (via `ANTHROPIC_API_KEY`)
+- **OpenRouter** - Access 200+ models from multiple providers (via `OPENROUTER_API_KEY`)
+- **Ollama** - Local models like Llama, Mistral, Qwen (via local Ollama server)
+- **Google** - Gemini Pro, Gemini Flash (via `GOOGLE_API_KEY`)
+
+Select your provider with `--provider <name>` or use the default (OpenAI). Set the appropriate API key environment variable for your chosen provider.
 
 ## Getting started
 
@@ -33,7 +45,24 @@ go install github.com/noperator/siftrank/cmd/siftrank@latest
 
 ### Configure
 
-Set your `OPENAI_API_KEY` environment variable.
+Set the API key for your chosen provider:
+
+```bash
+# OpenAI (default provider)
+export OPENAI_API_KEY="sk-..."
+
+# Anthropic
+export ANTHROPIC_API_KEY="sk-ant-..."
+
+# OpenRouter
+export OPENROUTER_API_KEY="sk-or-..."
+
+# Google
+export GOOGLE_API_KEY="..."
+
+# Ollama (runs locally, no API key needed)
+# Ensure Ollama server is running: ollama serve
+```
 
 ### Usage
 
@@ -41,11 +70,14 @@ Set your `OPENAI_API_KEY` environment variable.
 siftrank -h
 
 Options:
-  -f, --file string     input file (required)
-  -m, --model string    OpenAI model name (default "gpt-4o-mini")
-  -o, --output string   JSON output file
-  -p, --prompt string   initial prompt (prefix with @ to use a file)
-  -r, --relevance       post-process each item by providing relevance justification (skips round 1)
+  -f, --file string       input file (required)
+  -m, --model string      model name (default "gpt-4o-mini")
+  -o, --output string     JSON output file
+      --pattern string    glob pattern for filtering files in directory (default "*")
+  -p, --prompt string     initial prompt (prefix with @ to use a file)
+      --provider string   LLM provider: openai, anthropic, openrouter, ollama, google (default "openai")
+  -r, --relevance         post-process each item by providing relevance justification (skips round 1)
+      --compare string    compare multiple models (format: "provider:model,provider:model")
 
 Visualization:
       --no-minimap   disable minimap panel in watch mode
@@ -58,7 +90,7 @@ Debug:
       --trace string   trace file path for streaming trial execution state (JSON Lines format)
 
 Advanced:
-  -u, --base-url string         OpenAI API base URL (for compatible APIs like vLLM)
+  -u, --base-url string         custom API base URL (for OpenAI-compatible APIs like vLLM)
   -b, --batch-size int          number of items per batch (default 10)
   -c, --concurrency int         max concurrent LLM calls across all trials (default 50)
   -e, --effort string           reasoning effort level: none, minimal, low, medium, high
@@ -78,9 +110,11 @@ Flags:
   -h, --help   help for siftrank
 ```
 
-Compares 100 [sentences](https://github.com/noperator/siftrank/blob/main/testdata/sentences.txt) in 7 seconds.
+### Quick Example
 
-```
+Compares 100 [sentences](https://github.com/noperator/siftrank/blob/main/testdata/sentences.txt) in 7 seconds using the default provider (OpenAI):
+
+```bash
 siftrank \
     -f testdata/sentences.txt \
     -p 'Rank each of these items according to their relevancy to the concept of "time".' |
@@ -97,6 +131,24 @@ siftrank \
    8  The stars twinkled brightly in the clear night sky.
    9  He spotted a shooting star while stargazing.
   10  She opened the curtains to let in the morning light.
+```
+
+Use a different provider by specifying `--provider` and `--model`:
+
+```bash
+# Use Anthropic's Claude Sonnet
+siftrank \
+    --provider anthropic \
+    --model claude-sonnet-4-20250514 \
+    -f testdata/sentences.txt \
+    -p 'Rank by relevancy to "time".'
+
+# Use Ollama with a local model
+siftrank \
+    --provider ollama \
+    --model llama3.3 \
+    -f testdata/sentences.txt \
+    -p 'Rank by relevancy to "time".'
 ```
 
 <details><summary>Advanced usage</summary>
