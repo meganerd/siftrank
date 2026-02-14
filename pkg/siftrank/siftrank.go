@@ -56,6 +56,10 @@ const (
 	DefaultMinTrials         = 5
 	DefaultElbowMethod       = ElbowMethodCurvature
 	DefaultEnableConvergence = true
+
+	// MaxDocuments limits the total number of documents that can be ranked
+	// in a single operation to prevent out-of-memory conditions
+	MaxDocuments = 10000
 )
 
 // Word lists for generating memorable IDs
@@ -658,6 +662,11 @@ func (r *Ranker) RankFromFiles(filePaths []string, templateData string, forceJSO
 			return nil, fmt.Errorf("failed to load %s: %w", filePath, err)
 		}
 		allDocuments = append(allDocuments, docs...)
+	}
+
+	// Check document count limit to prevent memory exhaustion
+	if len(allDocuments) > MaxDocuments {
+		return nil, fmt.Errorf("too many documents to rank (max %d)", MaxDocuments)
 	}
 
 	if len(allDocuments) == 0 {
