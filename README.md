@@ -215,6 +215,108 @@ siftrank \
 {"key":"a4ayc_80","value":"1","object":{"nums":[1,2,3]},"score":3,"exposure":1,"rank":3}
 ```
 
+#### Token Usage and Performance Tracking
+
+`siftrank` tracks token consumption and performance metrics for all LLM calls, enabling cost estimation and model comparison.
+
+##### Token Tracking
+
+Every LLM API call records:
+- **Input tokens** (prompt tokens)
+- **Output tokens** (completion tokens)
+- **Reasoning tokens** (for o1/o3 models)
+
+Token usage accumulates across all trials and is included in the trace file (see `--trace` flag).
+
+##### Model Comparison with --compare
+
+Compare multiple models side-by-side to evaluate performance and cost tradeoffs:
+
+```bash
+# Compare OpenAI vs Anthropic
+siftrank \
+    -f testdata/sentences.txt \
+    -p 'Rank by relevancy to "time".' \
+    --compare "openai:gpt-4o-mini,anthropic:claude-haiku-4-20250514" \
+    --trace comparison.jsonl
+
+# Compare multiple OpenRouter models
+siftrank \
+    -f testdata/sentences.txt \
+    -p 'Rank by relevancy to "time".' \
+    --compare "openrouter:anthropic/claude-sonnet-4,openrouter:openai/gpt-4o" \
+    --trace comparison.jsonl
+```
+
+**Collected metrics per model:**
+- **Call count** - Total number of API calls
+- **Success rate** - Ratio of successful vs failed calls
+- **Latency statistics** - Average, P50, P95, P99 (milliseconds)
+- **Total tokens** - Sum of all input + output + reasoning tokens across all calls
+
+##### Trace File Format
+
+The `--trace <file>` flag writes JSON Lines output with detailed execution state:
+
+```bash
+siftrank -f data.txt -p 'Rank items' --trace trace.jsonl
+```
+
+Each line in the trace file contains:
+```json
+{
+  "trial": 1,
+  "round": 2,
+  "model": "gpt-4o-mini",
+  "batch_size": 10,
+  "input_tokens": 1234,
+  "output_tokens": 567,
+  "reasoning_tokens": 0,
+  "latency_ms": 850,
+  "success": true,
+  "elbow_detected": false
+}
+```
+
+Use the trace file to:
+- **Monitor progress** in real-time (`tail -f trace.jsonl`)
+- **Analyze token consumption** patterns across trials
+- **Compare model performance** when using `--compare`
+- **Debug convergence** behavior with elbow detection data
+
+##### Cost Estimation
+
+To estimate costs from token usage:
+
+1. **Extract token totals** from trace file:
+```bash
+jq -s 'map({model, input: .input_tokens, output: .output_tokens}) | group_by(.model) | map({model: .[0].model, total_input: (map(.input) | add), total_output: (map(.output) | add)})' trace.jsonl
+```
+
+2. **Apply provider pricing** (as of 2026-02):
+
+| Provider | Model | Input (per 1M tokens) | Output (per 1M tokens) |
+|----------|-------|-----------------------|------------------------|
+| OpenAI | gpt-4o-mini | $0.15 | $0.60 |
+| OpenAI | gpt-4o | $2.50 | $10.00 |
+| Anthropic | claude-haiku-4 | $0.25 | $1.25 |
+| Anthropic | claude-sonnet-4 | $3.00 | $15.00 |
+| OpenRouter | varies | varies | varies |
+| Ollama | free (local) | $0.00 | $0.00 |
+
+**Example cost calculation:**
+```
+Input tokens: 50,000
+Output tokens: 10,000
+Model: gpt-4o-mini
+
+Cost = (50,000 / 1,000,000) × $0.15 + (10,000 / 1,000,000) × $0.60
+     = $0.0075 + $0.0060
+     = $0.0135 (~1.4 cents)
+```
+
+> **Note:** Built-in cost reporting (automatic $ calculation) is planned for a future release. Track progress in issue siftrank-20.
+
 </details>
 
 ## Back matter
