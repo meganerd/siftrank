@@ -151,6 +151,170 @@ siftrank \
     -p 'Rank by relevancy to "time".'
 ```
 
+### Multi-Provider Examples
+
+Examples demonstrating different providers and use cases.
+
+#### OpenAI
+
+**Basic ranking with gpt-4o-mini (default):**
+```bash
+siftrank \
+    -f logs/access.log \
+    -p 'Find suspicious requests that might indicate an attack.' \
+    -o suspicious_requests.json
+```
+
+**Using GPT-4o for complex analysis:**
+```bash
+siftrank \
+    --provider openai \
+    --model gpt-4o \
+    -f cve_descriptions.txt \
+    -p 'Rank vulnerabilities by exploitability and impact.'
+```
+
+**With reasoning effort (o1/o3 models):**
+```bash
+siftrank \
+    --provider openai \
+    --model o1-mini \
+    --effort medium \
+    -f security_findings.json \
+    -p 'Prioritize findings by severity and likelihood of exploitation.'
+```
+
+#### Anthropic
+
+**Claude Sonnet for balanced performance:**
+```bash
+siftrank \
+    --provider anthropic \
+    --model claude-sonnet-4-20250514 \
+    -f research_papers.json \
+    -p 'Rank papers by relevance to LLM security.' \
+    --trace anthropic_trace.jsonl
+```
+
+**Claude Haiku for fast, cost-effective ranking:**
+```bash
+siftrank \
+    --provider anthropic \
+    --model claude-haiku-4-20250514 \
+    -f user_feedback.txt \
+    -p 'Identify feedback indicating bugs or usability issues.' \
+    --watch
+```
+
+**Claude Opus for highest quality analysis:**
+```bash
+siftrank \
+    --provider anthropic \
+    --model claude-opus-4-20250514 \
+    -f threat_intelligence.json \
+    -p 'Rank threats by sophistication and potential impact to our infrastructure.'
+```
+
+#### OpenRouter
+
+**Access multiple providers through one API:**
+```bash
+# Set OpenRouter API key
+export OPENROUTER_API_KEY="sk-or-..."
+
+# Use any model from OpenRouter's catalog
+siftrank \
+    --provider openrouter \
+    --model anthropic/claude-sonnet-4 \
+    -f documents.txt \
+    -p 'Find documents related to incident response.'
+```
+
+**Compare frontier models:**
+```bash
+siftrank \
+    --provider openrouter \
+    --model google/gemini-2.0-flash-exp \
+    -f code_review.json \
+    -p 'Identify security vulnerabilities in this code.' \
+    --compare "openrouter:anthropic/claude-sonnet-4,openrouter:openai/gpt-4o"
+```
+
+#### Ollama (Local Models)
+
+**Run completely local with Llama:**
+```bash
+# Ensure Ollama is running: ollama serve
+# Pull model if needed: ollama pull llama3.3
+
+siftrank \
+    --provider ollama \
+    --model llama3.3 \
+    -f sensitive_data.txt \
+    -p 'Identify PII that needs redaction.' \
+    -o redaction_candidates.json
+```
+
+**Use local model with custom Ollama server:**
+```bash
+siftrank \
+    --provider ollama \
+    --model qwen2.5-coder:7b \
+    --base-url http://gpu-server:11434 \
+    -f code_snippets.txt \
+    -p 'Rank code by complexity and maintainability.'
+```
+
+**Local model for privacy-sensitive ranking:**
+```bash
+siftrank \
+    --provider ollama \
+    --model mistral:7b-instruct \
+    -f employee_reviews.txt \
+    -p 'Identify reviews mentioning management concerns.' \
+    --no-converge \
+    --max-trials 10
+```
+
+#### Model Comparison
+
+**Compare cost vs performance:**
+```bash
+# Fast model vs quality model
+siftrank \
+    -f large_dataset.json \
+    -p 'Rank by business value.' \
+    --compare "openai:gpt-4o-mini,openai:gpt-4o" \
+    --trace comparison_cost_quality.jsonl
+```
+
+**Compare across providers:**
+```bash
+# OpenAI vs Anthropic vs local
+siftrank \
+    -f documents.txt \
+    -p 'Find documents about security best practices.' \
+    --compare "openai:gpt-4o-mini,anthropic:claude-haiku-4-20250514,ollama:llama3.3" \
+    --trace multi_provider_comparison.jsonl
+
+# Analyze results
+jq -s 'group_by(.model) | map({
+    model: .[0].model,
+    calls: length,
+    avg_latency: (map(.latency_ms) | add / length),
+    total_tokens: (map(.input_tokens + .output_tokens) | add)
+})' multi_provider_comparison.jsonl
+```
+
+**Compare OpenRouter models:**
+```bash
+siftrank \
+    -f research_questions.txt \
+    -p 'Prioritize research questions by impact.' \
+    --compare "openrouter:anthropic/claude-sonnet-4,openrouter:google/gemini-2.0-flash-exp,openrouter:meta-llama/llama-3.3-70b-instruct" \
+    --trace openrouter_comparison.jsonl
+```
+
 <details><summary>Advanced usage</summary>
 
 #### JSON support
