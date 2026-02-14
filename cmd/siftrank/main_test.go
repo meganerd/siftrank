@@ -373,3 +373,76 @@ func TestEnumerateFiles_AtLimit(t *testing.T) {
 		t.Errorf("Expected 1000 files, got %d", len(files))
 	}
 }
+
+// TestErrorMessages_NoPathDisclosure verifies error messages don't leak filesystem paths
+func TestErrorMessages_NoPathDisclosure(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Test 1: Non-existent path error should not include path
+	_, _, err := validateInputPath("/nonexistent/secret/path/file.txt")
+	if err == nil {
+		t.Fatal("Expected error for non-existent path")
+	}
+	if strings.Contains(err.Error(), "/nonexistent") || strings.Contains(err.Error(), "secret") {
+		t.Errorf("Error message contains path information: %v", err)
+	}
+
+	// Test 2: No pattern matches error should not include directory path
+	if err := os.WriteFile(filepath.Join(tmpDir, "test.txt"), []byte("data"), 0600); err != nil {
+		t.Fatalf("Failed to create test.txt: %v", err)
+	}
+	_, err = enumerateFiles(tmpDir, "*.json")
+	if err == nil {
+		t.Fatal("Expected error for no matches")
+	}
+	if strings.Contains(err.Error(), tmpDir) {
+		t.Errorf("Error message contains directory path: %v", err)
+	}
+	// But should still include the pattern (user input)
+	if !strings.Contains(err.Error(), "*.json") {
+		t.Errorf("Error message should include pattern: %v", err)
+	}
+
+	// Test 3: Directory traversal error should not expose resolved path
+	_, _, err = validateInputPath("../../etc/passwd")
+	if err == nil {
+		// Path may or may not exist, but we should test the error doesn't expose paths
+		// If no error, that's also fine - just means the path resolved to something valid
+	} else {
+		// Error should not contain the resolved absolute path
+		if strings.Contains(err.Error(), "/etc/passwd") {
+			t.Errorf("Error message contains resolved path: %v", err)
+		}
+	}
+
+	// Test 4: validatePath for directory should not expose path
+	_, err = validatePath(tmpDir)
+	if err == nil {
+		t.Fatal("Expected error for directory path")
+	}
+	if strings.Contains(err.Error(), tmpDir) {
+		t.Errorf("validatePath error contains directory path: %v", err)
+	}
+
+	// Test 5: validatePath for non-existent file that would exist
+	// This shouldn't error since validatePath allows non-existent output files
+	newFile := filepath.Join(tmpDir, "newfile.txt")
+	_, err = validatePath(newFile)
+	if err != nil {
+		t.Fatalf("Unexpected error for new output file: %v", err)
+	}
+
+	// Test 6: Symlink resolution failure should not expose path details
+	// Create a broken symlink
+	brokenLink := filepath.Join(tmpDir, "broken_link")
+	if err := os.Symlink("/nonexistent/target/path", brokenLink); err != nil {
+		t.Fatalf("Failed to create broken symlink: %v", err)
+	}
+	_, _, err = validateInputPath(brokenLink)
+	if err == nil {
+		t.Fatal("Expected error for broken symlink")
+	}
+	if strings.Contains(err.Error(), "/nonexistent/target/path") {
+		t.Errorf("Error message contains symlink target path: %v", err)
+	}
+}
