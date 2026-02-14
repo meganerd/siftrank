@@ -646,6 +646,42 @@ func (r *Ranker) RankFromFile(filePath string, templateData string, forceJSON bo
 	return r.rankDocuments(documents)
 }
 
+// RankFromFiles ranks documents loaded from multiple files
+// All documents are aggregated in memory before ranking
+func (r *Ranker) RankFromFiles(filePaths []string, templateData string, forceJSON bool) ([]*RankedDocument, error) {
+	var allDocuments []document
+
+	// Load documents from each file
+	for _, filePath := range filePaths {
+		docs, err := r.loadDocumentsFromFile(filePath, templateData, forceJSON)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load %s: %w", filePath, err)
+		}
+		allDocuments = append(allDocuments, docs...)
+	}
+
+	if len(allDocuments) == 0 {
+		return nil, fmt.Errorf("no documents loaded from %d files", len(filePaths))
+	}
+
+	// Set up trace file if needed (only once for all files)
+	if r.cfg.TracePath != "" {
+		traceFile, err := os.Create(r.cfg.TracePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create trace file: %w", err)
+		}
+		r.traceFile = traceFile
+		defer func() {
+			if err := r.traceFile.Close(); err != nil {
+				r.cfg.Logger.Warn("Failed to close trace file", "error", err)
+			}
+		}()
+	}
+
+	// Rank all documents as a single batch
+	return r.rankDocuments(allDocuments)
+}
+
 // RankFromReader ranks documents read from an io.Reader.
 //
 // Parameters:
