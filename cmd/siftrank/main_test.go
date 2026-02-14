@@ -446,3 +446,214 @@ func TestErrorMessages_NoPathDisclosure(t *testing.T) {
 		t.Errorf("Error message contains symlink target path: %v", err)
 	}
 }
+
+// Integration Tests for Large Directory Handling
+
+// TestLargeDirectory_Integration_AtLimit tests full workflow with 1000 files
+func TestLargeDirectory_Integration_AtLimit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	tmpDir := t.TempDir()
+
+	// Create exactly 1000 small text files
+	for i := 0; i < 1000; i++ {
+		filename := fmt.Sprintf("doc%04d.txt", i)
+		content := fmt.Sprintf("Document number %d\n", i)
+		if err := os.WriteFile(filepath.Join(tmpDir, filename), []byte(content), 0600); err != nil {
+			t.Fatalf("Failed to create %s: %v", filename, err)
+		}
+	}
+
+	// Validate directory input path
+	path, isDir, err := validateInputPath(tmpDir)
+	if err != nil {
+		t.Fatalf("validateInputPath() failed: %v", err)
+	}
+	if !isDir {
+		t.Fatalf("validateInputPath() expected directory, got file")
+	}
+
+	// Enumerate files with glob pattern
+	files, err := enumerateFiles(path, "*.txt")
+	if err != nil {
+		t.Fatalf("enumerateFiles() failed: %v", err)
+	}
+
+	if len(files) != 1000 {
+		t.Errorf("Expected 1000 files, got %d", len(files))
+	}
+
+	// Verify files are sorted
+	if !strings.HasSuffix(files[0], "doc0000.txt") {
+		t.Errorf("Expected first file to be doc0000.txt, got %s", files[0])
+	}
+	if !strings.HasSuffix(files[999], "doc0999.txt") {
+		t.Errorf("Expected last file to be doc0999.txt, got %s", files[999])
+	}
+}
+
+// TestLargeDirectory_Integration_ExceedsLimit tests full workflow exceeding 1000 files
+func TestLargeDirectory_Integration_ExceedsLimit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	tmpDir := t.TempDir()
+
+	// Create 1001 small text files (exceeds MaxFilesPerDirectory)
+	for i := 0; i < 1001; i++ {
+		filename := fmt.Sprintf("doc%04d.txt", i)
+		content := fmt.Sprintf("Document number %d\n", i)
+		if err := os.WriteFile(filepath.Join(tmpDir, filename), []byte(content), 0600); err != nil {
+			t.Fatalf("Failed to create %s: %v", filename, err)
+		}
+	}
+
+	// Validate directory input path (should succeed)
+	path, isDir, err := validateInputPath(tmpDir)
+	if err != nil {
+		t.Fatalf("validateInputPath() failed: %v", err)
+	}
+	if !isDir {
+		t.Fatalf("validateInputPath() expected directory, got file")
+	}
+
+	// Enumerate files should fail due to file count limit
+	_, err = enumerateFiles(path, "*.txt")
+	if err == nil {
+		t.Fatal("Expected error for directory exceeding file limit, got nil")
+	}
+
+	expectedMsg := "directory contains too many matching files (max 1000)"
+	if !strings.Contains(err.Error(), expectedMsg) {
+		t.Errorf("Expected error to contain %q, got: %v", expectedMsg, err)
+	}
+}
+
+// TestLargeDirectory_Integration_GlobFiltering tests glob filtering with large directory
+func TestLargeDirectory_Integration_GlobFiltering(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	tmpDir := t.TempDir()
+
+	// Create 500 .txt files and 500 .json files (1000 total, but each pattern matches 500)
+	for i := 0; i < 500; i++ {
+		txtFile := fmt.Sprintf("doc%04d.txt", i)
+		jsonFile := fmt.Sprintf("data%04d.json", i)
+
+		txtContent := fmt.Sprintf("Text document %d\n", i)
+		jsonContent := fmt.Sprintf("{\"id\": %d, \"type\": \"json\"}", i)
+
+		if err := os.WriteFile(filepath.Join(tmpDir, txtFile), []byte(txtContent), 0600); err != nil {
+			t.Fatalf("Failed to create %s: %v", txtFile, err)
+		}
+		if err := os.WriteFile(filepath.Join(tmpDir, jsonFile), []byte(jsonContent), 0600); err != nil {
+			t.Fatalf("Failed to create %s: %v", jsonFile, err)
+		}
+	}
+
+	// Validate directory
+	path, isDir, err := validateInputPath(tmpDir)
+	if err != nil {
+		t.Fatalf("validateInputPath() failed: %v", err)
+	}
+	if !isDir {
+		t.Fatalf("validateInputPath() expected directory, got file")
+	}
+
+	// Test 1: Filter only .txt files
+	txtFiles, err := enumerateFiles(path, "*.txt")
+	if err != nil {
+		t.Fatalf("enumerateFiles(*.txt) failed: %v", err)
+	}
+	if len(txtFiles) != 500 {
+		t.Errorf("Expected 500 .txt files, got %d", len(txtFiles))
+	}
+
+	// Test 2: Filter only .json files
+	jsonFiles, err := enumerateFiles(path, "*.json")
+	if err != nil {
+		t.Fatalf("enumerateFiles(*.json) failed: %v", err)
+	}
+	if len(jsonFiles) != 500 {
+		t.Errorf("Expected 500 .json files, got %d", len(jsonFiles))
+	}
+
+	// Test 3: Match all files with "*" pattern
+	allFiles, err := enumerateFiles(path, "*")
+	if err != nil {
+		t.Fatalf("enumerateFiles(*) failed: %v", err)
+	}
+	if len(allFiles) != 1000 {
+		t.Errorf("Expected 1000 total files, got %d", len(allFiles))
+	}
+
+	// Test 4: Specific pattern (doc*.txt should match all txt files starting with "doc")
+	docFiles, err := enumerateFiles(path, "doc*.txt")
+	if err != nil {
+		t.Fatalf("enumerateFiles(doc*.txt) failed: %v", err)
+	}
+	if len(docFiles) != 500 {
+		t.Errorf("Expected 500 doc*.txt files, got %d", len(docFiles))
+	}
+}
+
+// TestLargeDirectory_Integration_MixedSizes tests directory with files of varying sizes
+func TestLargeDirectory_Integration_MixedSizes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	tmpDir := t.TempDir()
+
+	// Create 100 files with varying sizes (small, medium, large content)
+	for i := 0; i < 100; i++ {
+		filename := fmt.Sprintf("doc%03d.txt", i)
+		var content string
+
+		// Vary content size
+		switch i % 3 {
+		case 0: // Small files (~50 bytes)
+			content = fmt.Sprintf("Small document %d\n", i)
+		case 1: // Medium files (~500 bytes)
+			content = strings.Repeat(fmt.Sprintf("Medium content for doc %d. ", i), 20)
+		case 2: // Larger files (~5000 bytes)
+			content = strings.Repeat(fmt.Sprintf("Large content block for document %d. ", i), 100)
+		}
+
+		if err := os.WriteFile(filepath.Join(tmpDir, filename), []byte(content), 0600); err != nil {
+			t.Fatalf("Failed to create %s: %v", filename, err)
+		}
+	}
+
+	// Validate directory
+	path, isDir, err := validateInputPath(tmpDir)
+	if err != nil {
+		t.Fatalf("validateInputPath() failed: %v", err)
+	}
+	if !isDir {
+		t.Fatalf("validateInputPath() expected directory, got file")
+	}
+
+	// Enumerate all files
+	files, err := enumerateFiles(path, "*.txt")
+	if err != nil {
+		t.Fatalf("enumerateFiles() failed: %v", err)
+	}
+
+	if len(files) != 100 {
+		t.Errorf("Expected 100 files, got %d", len(files))
+	}
+
+	// Verify deterministic ordering regardless of file size
+	if !strings.HasSuffix(files[0], "doc000.txt") {
+		t.Errorf("Expected first file to be doc000.txt, got %s", files[0])
+	}
+	if !strings.HasSuffix(files[99], "doc099.txt") {
+		t.Errorf("Expected last file to be doc099.txt, got %s", files[99])
+	}
+}
