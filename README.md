@@ -315,6 +315,209 @@ siftrank \
     --trace openrouter_comparison.jsonl
 ```
 
+### New Features Showcase
+
+Recent enhancements to `siftrank` enable advanced workflows for large-scale ranking tasks.
+
+#### Directory Input with Glob Patterns
+
+Process multiple files from a directory with optional pattern filtering:
+
+```bash
+# Process all JSON files in a directory
+siftrank \
+    -f ./data \
+    --pattern "*.json" \
+    -p 'Rank by importance' \
+    -o results.json
+
+# Process log files matching a pattern
+siftrank \
+    -f ./logs \
+    --pattern "error_*.log" \
+    -p 'Find critical errors that need immediate attention.' \
+    --watch
+```
+
+**Features:**
+- **Non-recursive** - Only processes files in the specified directory (not subdirectories)
+- **Glob filtering** - Use patterns like `*.txt`, `data_*.json`, or `report_[0-9]*.log`
+- **Aggregated ranking** - All documents from matching files are ranked together as a single dataset
+- **Sorted enumeration** - Files are processed in deterministic alphabetical order
+
+**Security:** Directory traversal (`..`) is blocked. Resource limits apply (1000 files per directory, 10000 documents total).
+
+#### Convergence Detection and Early Stopping
+
+Automatically stop ranking when results stabilize, saving time and API costs:
+
+```bash
+# Enable convergence detection (default behavior)
+siftrank \
+    -f data.txt \
+    -p 'Rank by quality' \
+    --min-trials 5 \
+    --stable-trials 5
+```
+
+**How it works:**
+- **Elbow detection** - Identifies the inflection point where scores plateau
+- **Stability tracking** - Waits for N consecutive trials with consistent elbow position
+- **Early exit** - Stops as soon as convergence criteria are met
+
+**Configuration:**
+```bash
+# Disable convergence for fixed trial count
+siftrank -f data.txt -p 'Rank' --no-converge --max-trials 20
+
+# Adjust convergence sensitivity
+siftrank -f data.txt -p 'Rank' \
+    --min-trials 3 \
+    --stable-trials 7 \
+    --elbow-tolerance 0.10
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--min-trials` | 5 | Minimum trials before checking convergence |
+| `--stable-trials` | 5 | Consecutive stable trials required |
+| `--elbow-tolerance` | 0.05 | Tolerance for elbow position stability (5%) |
+| `--no-converge` | false | Disable early stopping |
+
+**Typical savings:** 40-60% reduction in API calls for datasets with clear ranking signal.
+
+#### Elbow Detection Methods
+
+Choose between two elbow detection algorithms:
+
+```bash
+# Curvature-based detection (default)
+siftrank -f data.txt -p 'Rank' --elbow-method curvature
+
+# Perpendicular distance detection
+siftrank -f data.txt -p 'Rank' --elbow-method perpendicular
+```
+
+**Methods:**
+- **Curvature** (default) - Finds maximum curvature in the score curve. Best for smooth, exponential-like distributions.
+- **Perpendicular** - Maximizes perpendicular distance from line connecting first and last points. Best for linear-then-flat distributions.
+
+**When to switch methods:**
+- Use `curvature` for most cases - works well with typical ranking distributions
+- Use `perpendicular` if curvature fails to detect an obvious inflection point
+- Compare both with `--trace` and visual inspection
+
+#### Watch Mode Visualization
+
+Monitor ranking progress in real-time with terminal-based visualization:
+
+```bash
+# Enable watch mode
+siftrank -f data.txt -p 'Rank by priority' --watch
+
+# Watch mode without minimap (larger chart)
+siftrank -f data.txt -p 'Rank' --watch --no-minimap
+```
+
+**Display panels:**
+- **Score chart** - Real-time convergence visualization with elbow marker
+- **Minimap** - Overview of full score distribution (disable with `--no-minimap`)
+- **Statistics** - Trial count, convergence status, API call count
+- **Top items** - Live preview of current top-ranked results
+
+**Note:** Watch mode suppresses log output by default. Use `--log <file>` to capture logs while watching.
+
+#### Relevance Justification Mode
+
+Generate structured explanations for each ranked item:
+
+```bash
+# Add pros/cons for each result
+siftrank \
+    -f data.txt \
+    -p 'Rank security vulnerabilities by severity' \
+    --relevance \
+    -o results.json
+```
+
+**Output format** (with `--relevance`):
+```json
+{
+  "key": "abc123",
+  "value": "SQL injection in login form",
+  "score": 0,
+  "rank": 1,
+  "justification": {
+    "pros": [
+      "Direct database access",
+      "Authentication bypass potential",
+      "High exploitability"
+    ],
+    "cons": [
+      "Requires network access",
+      "May be mitigated by WAF"
+    ]
+  }
+}
+```
+
+**Use cases:**
+- **Decision support** - Understand why items ranked high/low
+- **Quality assurance** - Validate LLM reasoning
+- **Reporting** - Generate audit trails with explanations
+
+**Note:** Relevance mode skips initial trial round (jumps directly to justification), so use with a reasonable `--max-trials` limit.
+
+#### Trace File Monitoring
+
+Stream execution state to a file for analysis and debugging:
+
+```bash
+# Basic trace
+siftrank -f data.txt -p 'Rank' --trace trace.jsonl
+
+# Monitor in real-time
+siftrank -f data.txt -p 'Rank' --trace trace.jsonl &
+tail -f trace.jsonl | jq
+```
+
+**Trace file contents** (JSON Lines format):
+```json
+{"trial":1,"round":1,"model":"gpt-4o-mini","input_tokens":1234,"output_tokens":567,"latency_ms":850}
+{"trial":1,"round":2,"model":"gpt-4o-mini","input_tokens":1156,"output_tokens":489,"latency_ms":790}
+{"trial":2,"round":1,"model":"gpt-4o-mini","input_tokens":1234,"output_tokens":602,"latency_ms":820}
+```
+
+**Analysis examples:**
+
+```bash
+# Calculate total cost
+jq -s 'map(.input_tokens + .output_tokens) | add' trace.jsonl
+
+# Latency percentiles
+jq -s 'map(.latency_ms) | sort | .[length*0.95 | floor]' trace.jsonl
+
+# Success rate
+jq -s 'map(.success) | add / length * 100' trace.jsonl
+```
+
+**With --compare:**
+```bash
+siftrank \
+    -f data.txt \
+    -p 'Rank' \
+    --compare "openai:gpt-4o-mini,anthropic:claude-haiku-4-20250514" \
+    --trace comparison.jsonl
+
+# Compare model performance
+jq -s 'group_by(.model) | map({
+    model: .[0].model,
+    calls: length,
+    avg_latency: (map(.latency_ms) | add / length),
+    total_cost: (map(.input_tokens + .output_tokens) | add)
+})' comparison.jsonl
+```
+
 <details><summary>Advanced usage</summary>
 
 #### JSON support
