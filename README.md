@@ -40,7 +40,7 @@ Select your provider with `--provider <name>` or use the default (OpenAI). Set t
 ### Install
 
 ```
-go install github.com/noperator/siftrank/cmd/siftrank@latest
+go install github.com/meganerd/siftrank/cmd/siftrank@latest
 ```
 
 ### Configure
@@ -112,7 +112,7 @@ Flags:
 
 ### Quick Example
 
-Compares 100 [sentences](https://github.com/noperator/siftrank/blob/main/testdata/sentences.txt) in 7 seconds using the default provider (OpenAI):
+Compares 100 [sentences](https://github.com/meganerd/siftrank/blob/main/testdata/sentences.txt) in 7 seconds using the default provider (OpenAI):
 
 ```bash
 siftrank \

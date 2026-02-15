@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/noperator/siftrank/pkg/siftrank/eval"
+	"github.com/meganerd/siftrank/pkg/siftrank/eval"
 	"github.com/openai/openai-go"
 )
 

@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/noperator/siftrank/pkg/siftrank"
+	"github.com/meganerd/siftrank/pkg/siftrank"
 	"github.com/openai/openai-go"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
