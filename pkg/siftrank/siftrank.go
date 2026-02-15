@@ -625,10 +625,20 @@ func ShortDeterministicID(input string, length int) string {
 // For text files, each non-empty line becomes a document.
 // For JSON files, expects an array of objects.
 //
+// The inputFD parameter is an optional open file descriptor from validateInputPath().
+// If provided, it is used to get the validated file path via Name(). The FD ownership
+// remains with the caller (caller must close it).
+//
 // Returns ranked documents sorted by score (lower = better), or error if
 // ranking fails (e.g., LLM auth error, invalid input).
-func (r *Ranker) RankFromFile(filePath string, templateData string, forceJSON bool) ([]*RankedDocument, error) {
-	documents, err := r.loadDocumentsFromFile(filePath, templateData, forceJSON)
+func (r *Ranker) RankFromFile(filePath string, inputFD *os.File, templateData string, forceJSON bool) ([]*RankedDocument, error) {
+	// If file descriptor provided, use its path (already validated)
+	actualPath := filePath
+	if inputFD != nil {
+		actualPath = inputFD.Name()
+	}
+
+	documents, err := r.loadDocumentsFromFile(actualPath, templateData, forceJSON)
 	if err != nil {
 		return nil, err
 	}

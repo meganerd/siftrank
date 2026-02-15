@@ -423,9 +423,8 @@ func run(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to rank from directory: %w", err)
 		}
 	} else {
-		// File input: use existing path
-		// TODO (siftrank-44): Pass inputFD to RankFromFile instead of path
-		finalResults, err = ranker.RankFromFile(validPath, inputTemplate, forceJSON)
+		// File input: pass file descriptor to RankFromFile
+		finalResults, err = ranker.RankFromFile(validPath, inputFD, inputTemplate, forceJSON)
 		if err != nil {
 			return fmt.Errorf("failed to rank from file: %w", err)
 		}
