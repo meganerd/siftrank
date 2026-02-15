@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="img/logo-dark.png">
-    <img alt="logo" src="img/logo-light.png" width="500px">
+    <source media="(prefers-color-scheme: dark)" srcset="img/logo-dark.meganerd.png">
+    <img alt="logo" src="img/logo-light.meganerd.png" width="500px">
   </picture>
   <br>
   Use LLMs for document ranking.
@@ -40,7 +40,7 @@ Select your provider with `--provider <name>` or use the default (OpenAI). Set t
 ### Install
 
 ```
-go install github.com/noperator/siftrank/cmd/siftrank@latest
+go install github.com/meganerd/siftrank/cmd/siftrank@latest
 ```
 
 ### Configure
@@ -112,7 +112,7 @@ Flags:
 
 ### Quick Example
 
-Compares 100 [sentences](https://github.com/noperator/siftrank/blob/main/testdata/sentences.txt) in 7 seconds using the default provider (OpenAI):
+Compares 100 [sentences](https://github.com/meganerd/siftrank/blob/main/testdata/sentences.txt) in 7 seconds using the default provider (OpenAI):
 
 ```bash
 siftrank \
@@ -690,7 +690,16 @@ Cost = (50,000 / 1,000,000) × $0.15 + (10,000 / 1,000,000) × $0.60
 
 ### Acknowledgements
 
-I released the prototype of this tool, Raink, while at Bishop Fox. See the original [presentation](https://www.youtube.com/watch?v=IBuL1zY69tY), [blog post](https://bishopfox.com/blog/raink-llms-document-ranking) and [CLI tool](https://github.com/bishopfox/raink).
+This project is a fork and significant evolution of [Raink](https://github.com/bishopfox/raink), originally created by [noperator](https://github.com/noperator) at Bishop Fox. The original Raink prototype introduced the core SiftRank algorithm and demonstrated LLM-based document ranking for security research. See the original [presentation](https://www.youtube.com/watch?v=IBuL1zY69tY), [blog post](https://bishopfox.com/blog/raink-llms-document-ranking), and [CLI tool](https://github.com/bishopfox/raink).
+
+**This fork (siftrank.meganerd) represents a substantial rewrite with:**
+- **Provider-agnostic architecture** - Support for OpenAI, Anthropic, OpenRouter, Ollama, and Google (upstream: OpenAI only)
+- **Production-grade reliability** - Comprehensive error handling, resource limits, security hardening
+- **Advanced features** - Convergence detection, directory input, watch mode visualization, trace monitoring, cost tracking
+- **Model comparison** - Side-by-side evaluation across providers with performance metrics
+- **Extensive documentation** - Multi-provider examples, practical use cases, cost estimation guidance
+
+While building on the foundational algorithm from Raink, this implementation diverges significantly in architecture, capabilities, and scope. Both projects share the goal of making LLM-powered document ranking accessible and practical.
 
 ### See also
 

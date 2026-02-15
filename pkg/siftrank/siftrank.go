@@ -26,7 +26,7 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
-	"github.com/noperator/siftrank/pkg/siftrank/eval"
+	"github.com/meganerd/siftrank/pkg/siftrank/eval"
 	"github.com/openai/openai-go"
 )
 
