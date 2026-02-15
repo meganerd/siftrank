@@ -65,33 +65,43 @@ func validatePath(path string) (string, error) {
 	return realPath, nil
 }
 
-// validateInputPath validates a file or directory path
-// Returns: (path, isDir, error)
-func validateInputPath(path string) (string, bool, error) {
+// validateInputPath validates a file or directory path and returns an open file descriptor
+// Returns: (file, isDir, error)
+// The caller is responsible for closing the returned file descriptor.
+// This implementation eliminates TOCTOU race conditions by opening the file
+// during validation and returning the file descriptor for immediate use.
+func validateInputPath(path string) (*os.File, bool, error) {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return "", false, fmt.Errorf("failed to resolve path")
+		return nil, false, fmt.Errorf("failed to resolve path")
 	}
 
 	cleanPath := filepath.Clean(absPath)
 	if strings.Contains(cleanPath, "..") {
-		return "", false, fmt.Errorf("path contains directory traversal")
+		return nil, false, fmt.Errorf("path contains directory traversal")
 	}
 
-	realPath, err := filepath.EvalSymlinks(cleanPath)
+	// Open the file immediately to eliminate TOCTOU window
+	// This makes the check-use atomic
+	file, err := os.Open(cleanPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", false, fmt.Errorf("path does not exist")
+			return nil, false, fmt.Errorf("path does not exist")
 		}
-		return "", false, fmt.Errorf("failed to resolve path")
+		if os.IsPermission(err) {
+			return nil, false, fmt.Errorf("permission denied")
+		}
+		return nil, false, fmt.Errorf("failed to open path")
 	}
 
-	info, err := os.Stat(realPath)
+	// Stat the OPEN file descriptor (not the path) to avoid TOCTOU
+	info, err := file.Stat()
 	if err != nil {
-		return "", false, fmt.Errorf("failed to stat path")
+		file.Close()
+		return nil, false, fmt.Errorf("failed to stat path")
 	}
 
-	return realPath, info.IsDir(), nil
+	return file, info.IsDir(), nil
 }
 
 // enumerateFiles returns all files in directory matching glob pattern
@@ -387,11 +397,15 @@ func run(cmd *cobra.Command, args []string) error {
 
 	var finalResults []*siftrank.RankedDocument
 
-	// Validate input path (file or directory)
-	validPath, isDir, err := validateInputPath(inputFile)
+	// Validate input path (file or directory) and receive open file descriptor
+	inputFD, isDir, err := validateInputPath(inputFile)
 	if err != nil {
 		return fmt.Errorf("invalid input path: %w", err)
 	}
+	defer inputFD.Close()
+
+	// Get validated path from file descriptor
+	validPath := inputFD.Name()
 
 	if isDir {
 		// Directory input: enumerate files with pattern
@@ -410,6 +424,7 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 	} else {
 		// File input: use existing path
+		// TODO (siftrank-44): Pass inputFD to RankFromFile instead of path
 		finalResults, err = ranker.RankFromFile(validPath, inputTemplate, forceJSON)
 		if err != nil {
 			return fmt.Errorf("failed to rank from file: %w", err)

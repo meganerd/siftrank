@@ -119,17 +119,18 @@ func TestEnumerateFiles_SkipsSubdirectories(t *testing.T) {
 func TestValidateInputPath_Directory(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	path, isDir, err := validateInputPath(tmpDir)
+	file, isDir, err := validateInputPath(tmpDir)
 	if err != nil {
 		t.Fatalf("validateInputPath() unexpected error: %v", err)
 	}
+	defer file.Close()
 
 	if !isDir {
 		t.Error("validateInputPath() expected isDir=true for directory")
 	}
 
-	if path == "" {
-		t.Error("validateInputPath() returned empty path")
+	if file == nil {
+		t.Error("validateInputPath() returned nil file descriptor")
 	}
 }
 
@@ -141,17 +142,18 @@ func TestValidateInputPath_File(t *testing.T) {
 		t.Fatalf("Failed to create test.txt: %v", err)
 	}
 
-	path, isDir, err := validateInputPath(tmpFile)
+	file, isDir, err := validateInputPath(tmpFile)
 	if err != nil {
 		t.Fatalf("validateInputPath() unexpected error: %v", err)
 	}
+	defer file.Close()
 
 	if isDir {
 		t.Error("validateInputPath() expected isDir=false for file")
 	}
 
-	if path == "" {
-		t.Error("validateInputPath() returned empty path")
+	if file == nil {
+		t.Error("validateInputPath() returned nil file descriptor")
 	}
 }
 
@@ -190,17 +192,18 @@ func TestValidateInputPath_DirectoryTraversal(t *testing.T) {
 	// Since the current implementation resolves ".." via filepath.Clean,
 	// the directory traversal check only catches literal ".." in the final path
 	// This is a valid test that the path resolution works correctly
-	path, isDir, err := validateInputPath(nestedDir)
+	file, isDir, err := validateInputPath(nestedDir)
 	if err != nil {
 		t.Fatalf("validateInputPath() unexpected error: %v", err)
 	}
+	defer file.Close()
 
 	if !isDir {
 		t.Error("validateInputPath() expected isDir=true for nested directory")
 	}
 
-	if path == "" {
-		t.Error("validateInputPath() returned empty path")
+	if file == nil {
+		t.Error("validateInputPath() returned nil file descriptor")
 	}
 }
 
@@ -467,16 +470,17 @@ func TestLargeDirectory_Integration_AtLimit(t *testing.T) {
 	}
 
 	// Validate directory input path
-	path, isDir, err := validateInputPath(tmpDir)
+	dirFD, isDir, err := validateInputPath(tmpDir)
 	if err != nil {
 		t.Fatalf("validateInputPath() failed: %v", err)
 	}
+	defer dirFD.Close()
 	if !isDir {
 		t.Fatalf("validateInputPath() expected directory, got file")
 	}
 
 	// Enumerate files with glob pattern
-	files, err := enumerateFiles(path, "*.txt")
+	files, err := enumerateFiles(dirFD.Name(), "*.txt")
 	if err != nil {
 		t.Fatalf("enumerateFiles() failed: %v", err)
 	}
@@ -512,16 +516,17 @@ func TestLargeDirectory_Integration_ExceedsLimit(t *testing.T) {
 	}
 
 	// Validate directory input path (should succeed)
-	path, isDir, err := validateInputPath(tmpDir)
+	dirFD, isDir, err := validateInputPath(tmpDir)
 	if err != nil {
 		t.Fatalf("validateInputPath() failed: %v", err)
 	}
+	defer dirFD.Close()
 	if !isDir {
 		t.Fatalf("validateInputPath() expected directory, got file")
 	}
 
 	// Enumerate files should fail due to file count limit
-	_, err = enumerateFiles(path, "*.txt")
+	_, err = enumerateFiles(dirFD.Name(), "*.txt")
 	if err == nil {
 		t.Fatal("Expected error for directory exceeding file limit, got nil")
 	}
@@ -557,16 +562,17 @@ func TestLargeDirectory_Integration_GlobFiltering(t *testing.T) {
 	}
 
 	// Validate directory
-	path, isDir, err := validateInputPath(tmpDir)
+	dirFD, isDir, err := validateInputPath(tmpDir)
 	if err != nil {
 		t.Fatalf("validateInputPath() failed: %v", err)
 	}
+	defer dirFD.Close()
 	if !isDir {
 		t.Fatalf("validateInputPath() expected directory, got file")
 	}
 
 	// Test 1: Filter only .txt files
-	txtFiles, err := enumerateFiles(path, "*.txt")
+	txtFiles, err := enumerateFiles(dirFD.Name(), "*.txt")
 	if err != nil {
 		t.Fatalf("enumerateFiles(*.txt) failed: %v", err)
 	}
@@ -575,7 +581,7 @@ func TestLargeDirectory_Integration_GlobFiltering(t *testing.T) {
 	}
 
 	// Test 2: Filter only .json files
-	jsonFiles, err := enumerateFiles(path, "*.json")
+	jsonFiles, err := enumerateFiles(dirFD.Name(), "*.json")
 	if err != nil {
 		t.Fatalf("enumerateFiles(*.json) failed: %v", err)
 	}
@@ -584,7 +590,7 @@ func TestLargeDirectory_Integration_GlobFiltering(t *testing.T) {
 	}
 
 	// Test 3: Match all files with "*" pattern
-	allFiles, err := enumerateFiles(path, "*")
+	allFiles, err := enumerateFiles(dirFD.Name(), "*")
 	if err != nil {
 		t.Fatalf("enumerateFiles(*) failed: %v", err)
 	}
@@ -593,7 +599,7 @@ func TestLargeDirectory_Integration_GlobFiltering(t *testing.T) {
 	}
 
 	// Test 4: Specific pattern (doc*.txt should match all txt files starting with "doc")
-	docFiles, err := enumerateFiles(path, "doc*.txt")
+	docFiles, err := enumerateFiles(dirFD.Name(), "doc*.txt")
 	if err != nil {
 		t.Fatalf("enumerateFiles(doc*.txt) failed: %v", err)
 	}
@@ -631,16 +637,17 @@ func TestLargeDirectory_Integration_MixedSizes(t *testing.T) {
 	}
 
 	// Validate directory
-	path, isDir, err := validateInputPath(tmpDir)
+	dirFD, isDir, err := validateInputPath(tmpDir)
 	if err != nil {
 		t.Fatalf("validateInputPath() failed: %v", err)
 	}
+	defer dirFD.Close()
 	if !isDir {
 		t.Fatalf("validateInputPath() expected directory, got file")
 	}
 
 	// Enumerate all files
-	files, err := enumerateFiles(path, "*.txt")
+	files, err := enumerateFiles(dirFD.Name(), "*.txt")
 	if err != nil {
 		t.Fatalf("enumerateFiles() failed: %v", err)
 	}
