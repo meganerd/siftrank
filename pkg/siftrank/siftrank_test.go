@@ -122,7 +122,7 @@ func TestRankFromFile_DryRun(t *testing.T) {
 		t.Fatalf("NewRanker() unexpected error: %v", err)
 	}
 
-	results, err := ranker.RankFromFile(testFile, "{{.Data}}", false)
+	results, err := ranker.RankFromFile(testFile, nil, "{{.Data}}", false)
 	if err != nil {
 		t.Errorf("RankFromFile() unexpected error: %v", err)
 		return
@@ -200,7 +200,7 @@ func TestRankFromFile_WithSentencesData(t *testing.T) {
 		t.Fatalf("NewRanker() unexpected error: %v", err)
 	}
 
-	results, err := ranker.RankFromFile(sentencesFile, "{{.Data}}", false)
+	results, err := ranker.RankFromFile(sentencesFile, nil, "{{.Data}}", false)
 	if err != nil {
 		t.Fatalf("RankFromFile() unexpected error: %v", err)
 	}
@@ -294,7 +294,7 @@ func TestRankFromFile_Errors(t *testing.T) {
 	}
 
 	// Test with non-existent file
-	_, err = ranker.RankFromFile("nonexistent.txt", "{{.Data}}", false)
+	_, err = ranker.RankFromFile("nonexistent.txt", nil, "{{.Data}}", false)
 	if err == nil {
 		t.Error("RankFromFile() with non-existent file should return error")
 	}
@@ -306,7 +306,7 @@ func TestRankFromFile_Errors(t *testing.T) {
 		t.Fatalf("Failed to create test file: %v", err)
 	}
 
-	_, err = ranker.RankFromFile(testFile, "{{.InvalidField | badFunc}}", false)
+	_, err = ranker.RankFromFile(testFile, nil, "{{.InvalidField | badFunc}}", false)
 	if err == nil {
 		t.Error("RankFromFile() with invalid template should return error")
 	}
