@@ -1,4 +1,4 @@
-module github.com/noperator/siftrank
+module github.com/meganerd/siftrank
 
 go 1.24.0
 
