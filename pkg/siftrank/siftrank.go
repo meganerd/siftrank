@@ -661,10 +661,19 @@ func (r *Ranker) RankFromFiles(filePaths []string, templateData string, forceJSO
 	var allDocuments []document
 
 	// Load documents from each file
-	// Note: We pass nil for inputFD here. Task 4 (siftrank-46) will update this
-	// to open files immediately and pass file descriptors.
+	// Open each file immediately to eliminate TOCTOU race conditions
 	for _, filePath := range filePaths {
-		docs, err := r.loadDocumentsFromFile(filePath, nil, templateData, forceJSON)
+		// Open file immediately (TOCTOU mitigation for directory input)
+		// #nosec G304 - filePath comes from enumerateFiles which validates parent directory
+		file, err := os.Open(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open %s: %w", filePath, err)
+		}
+
+		// Load documents using the open file descriptor
+		docs, err := r.loadDocumentsFromFile(filePath, file, templateData, forceJSON)
+		file.Close() // Close immediately after loading (not defer - we're in a loop)
+
 		if err != nil {
 			return nil, fmt.Errorf("failed to load %s: %w", filePath, err)
 		}
