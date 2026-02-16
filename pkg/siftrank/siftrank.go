@@ -632,13 +632,8 @@ func ShortDeterministicID(input string, length int) string {
 // Returns ranked documents sorted by score (lower = better), or error if
 // ranking fails (e.g., LLM auth error, invalid input).
 func (r *Ranker) RankFromFile(filePath string, inputFD *os.File, templateData string, forceJSON bool) ([]*RankedDocument, error) {
-	// If file descriptor provided, use its path (already validated)
-	actualPath := filePath
-	if inputFD != nil {
-		actualPath = inputFD.Name()
-	}
-
-	documents, err := r.loadDocumentsFromFile(actualPath, templateData, forceJSON)
+	// Pass the file descriptor to loadDocumentsFromFile for TOCTOU-safe operation
+	documents, err := r.loadDocumentsFromFile(filePath, inputFD, templateData, forceJSON)
 	if err != nil {
 		return nil, err
 	}
@@ -666,8 +661,10 @@ func (r *Ranker) RankFromFiles(filePaths []string, templateData string, forceJSO
 	var allDocuments []document
 
 	// Load documents from each file
+	// Note: We pass nil for inputFD here. Task 4 (siftrank-46) will update this
+	// to open files immediately and pass file descriptors.
 	for _, filePath := range filePaths {
-		docs, err := r.loadDocumentsFromFile(filePath, templateData, forceJSON)
+		docs, err := r.loadDocumentsFromFile(filePath, nil, templateData, forceJSON)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load %s: %w", filePath, err)
 		}
@@ -920,18 +917,42 @@ func (r *Ranker) rankDocuments(documents []document) ([]*RankedDocument, error) 
 	return results, nil
 }
 
-func (r *Ranker) loadDocumentsFromFile(filePath string, templateData string, forceJSON bool) ([]document, error) {
-	validPath, err := validatePath(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("invalid input file path: %w", err)
+// loadDocumentsFromFile loads documents from a file, optionally using a pre-opened file descriptor.
+//
+// If inputFD is provided (non-nil), it is used directly and the caller remains responsible
+// for closing it. This eliminates the TOCTOU race condition by avoiding a second open operation.
+//
+// If inputFD is nil, the function opens the file itself using the filePath parameter (backward
+// compatibility for internal callers that don't have a pre-opened FD).
+func (r *Ranker) loadDocumentsFromFile(filePath string, inputFD *os.File, templateData string, forceJSON bool) ([]document, error) {
+	var file *os.File
+	var validPath string
+	var shouldClose bool
+
+	if inputFD != nil {
+		// Use pre-opened file descriptor (already validated by validateInputPath)
+		file = inputFD
+		validPath = inputFD.Name()
+		shouldClose = false // Caller owns the FD
+	} else {
+		// Backward compatibility: validate and open ourselves
+		var err error
+		validPath, err = validatePath(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("invalid input file path: %w", err)
+		}
+
+		// #nosec G304 - Path validated by validatePath (no traversal, symlinks resolved)
+		file, err = os.Open(validPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open input file %s: %w", validPath, err)
+		}
+		shouldClose = true
 	}
 
-	// #nosec G304 - Path validated by validatePath (no traversal, symlinks resolved)
-	file, err := os.Open(validPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open input file %s: %w", validPath, err)
+	if shouldClose {
+		defer file.Close()
 	}
-	defer file.Close()
 
 	ext := strings.ToLower(filepath.Ext(validPath))
 	isJSON := ext == ".json" || forceJSON
