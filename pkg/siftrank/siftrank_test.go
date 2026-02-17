@@ -164,6 +164,55 @@ func TestRankFromFile_DryRun(t *testing.T) {
 	}
 }
 
+func TestRanker_TotalUsage(t *testing.T) {
+	// Create a temporary test file
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "test.txt")
+	content := "apple\nbanana\ncherry"
+	if err := os.WriteFile(testFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+
+	config := &Config{
+		InitialPrompt:   "Rank items",
+		BatchSize:       3,
+		NumTrials:       1,
+		Concurrency:     20,
+		OpenAIModel:     openai.ChatModelGPT4oMini,
+		RefinementRatio: 0.0,
+		OpenAIKey:       "test-key",
+		Encoding:        "o200k_base",
+		BatchTokens:     2000,
+		DryRun:          true,
+	}
+
+	ranker, err := NewRanker(config)
+	if err != nil {
+		t.Fatalf("NewRanker() unexpected error: %v", err)
+	}
+
+	// Before ranking, TotalUsage should be zero
+	usage := ranker.TotalUsage()
+	if usage.InputTokens != 0 || usage.OutputTokens != 0 {
+		t.Errorf("Expected zero usage before ranking, got input=%d output=%d",
+			usage.InputTokens, usage.OutputTokens)
+	}
+
+	// Run a dry-run ranking (no actual API calls, so tokens stay at 0)
+	_, err = ranker.RankFromFile(testFile, nil, "{{.Data}}", false)
+	if err != nil {
+		t.Fatalf("RankFromFile() unexpected error: %v", err)
+	}
+
+	// After dry-run ranking, TotalUsage should still work (returns accumulated usage)
+	usage = ranker.TotalUsage()
+	// In dry-run mode, tokens are 0, but the method should return without error
+	if usage.InputTokens < 0 || usage.OutputTokens < 0 {
+		t.Errorf("TotalUsage returned negative values: input=%d output=%d",
+			usage.InputTokens, usage.OutputTokens)
+	}
+}
+
 func TestRankFromFile_WithSentencesData(t *testing.T) {
 	sentencesFile := filepath.Join("..", "..", "testdata", "sentences.txt")
 

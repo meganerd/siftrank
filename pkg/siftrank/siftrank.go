@@ -926,6 +926,11 @@ func (r *Ranker) rankDocuments(documents []document) ([]*RankedDocument, error) 
 	return results, nil
 }
 
+// TotalUsage returns the accumulated token usage across all ranking rounds.
+func (r *Ranker) TotalUsage() Usage {
+	return r.totalUsage
+}
+
 // loadDocumentsFromFile loads documents from a file, optionally using a pre-opened file descriptor.
 //
 // If inputFD is provided (non-nil), it is used directly and the caller remains responsible
