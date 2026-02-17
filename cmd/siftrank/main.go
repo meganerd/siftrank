@@ -179,13 +179,14 @@ var (
 	elbowMethod    string
 
 	// Execution params
-	dryRun    bool
-	debug     bool
-	relevance bool
-	traceFile string
-	watch     bool
-	noMinimap bool
-	logFile   string
+	dryRun     bool
+	debug      bool
+	relevance  bool
+	traceFile  string
+	watch      bool
+	noMinimap  bool
+	logFile    string
+	reportCost bool
 )
 
 // setFlagGroup annotates flags with a group name for organized help output.
@@ -292,6 +293,7 @@ func init() {
 	rootCmd.Flags().BoolVar(&watch, "watch", false, "enable live terminal visualization (logs suppressed unless --log is specified)")
 	rootCmd.Flags().BoolVar(&noMinimap, "no-minimap", false, "disable minimap panel in watch mode")
 	rootCmd.Flags().StringVar(&logFile, "log", "", "write logs to file instead of stderr")
+	rootCmd.Flags().BoolVar(&reportCost, "report-cost", false, "print estimated cost summary to stderr after ranking")
 
 	// Register template functions for flag grouping
 	cobra.AddTemplateFunc("FlagsInGroup", FlagsInGroup)
@@ -304,7 +306,7 @@ func init() {
 	rootCmd.SetUsageTemplate(usageTemplate)
 
 	// Organize flags into groups
-	setFlagGroup(rootCmd, "options", "file", "prompt", "output", "provider", "model", "relevance", "compare", "pattern")
+	setFlagGroup(rootCmd, "options", "file", "prompt", "output", "provider", "model", "relevance", "compare", "pattern", "report-cost")
 	setFlagGroup(rootCmd, "visualization", "watch", "no-minimap")
 	setFlagGroup(rootCmd, "debug", "trace", "debug", "dry-run", "log")
 	setFlagGroup(rootCmd, "advanced", "template", "json", "base-url", "encoding", "effort", "tokens", "batch-size", "max-trials", "concurrency", "ratio", "no-converge", "elbow-tolerance", "stable-trials", "min-trials", "elbow-method")
@@ -466,6 +468,28 @@ func run(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to rank from file: %w", err)
 		}
+	}
+
+	// Report cost if requested (print to stderr before results)
+	if reportCost {
+		registry := siftrank.DefaultPricingRegistry()
+		acc := siftrank.NewCostAccumulator(oaiModel, registry)
+		acc.Add(ranker.TotalUsage())
+		summary := acc.Summary()
+
+		fmt.Fprintf(os.Stderr, "\n--- Cost Report ---\n")
+		fmt.Fprintf(os.Stderr, "Model:         %s\n", summary.Model)
+		fmt.Fprintf(os.Stderr, "Input tokens:  %d\n", summary.TotalUsage.InputTokens)
+		fmt.Fprintf(os.Stderr, "Output tokens: %d\n", summary.TotalUsage.OutputTokens)
+		if summary.TotalUsage.ReasoningTokens > 0 {
+			fmt.Fprintf(os.Stderr, "Reasoning:     %d\n", summary.TotalUsage.ReasoningTokens)
+		}
+		if summary.TotalCost > 0 {
+			fmt.Fprintf(os.Stderr, "Estimated cost: $%.6f\n", summary.TotalCost)
+		} else {
+			fmt.Fprintf(os.Stderr, "Estimated cost: $0.00 (model not in pricing registry)\n")
+		}
+		fmt.Fprintf(os.Stderr, "-------------------\n")
 	}
 
 	// Marshal results to JSON
