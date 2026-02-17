@@ -11,7 +11,6 @@ import (
 	"strings"
 
 	"github.com/meganerd/siftrank/pkg/siftrank"
-	"github.com/openai/openai-go"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -164,7 +163,8 @@ var (
 	batchTokens     int
 	refinementRatio float64
 
-	// Model params
+	// Provider/Model params
+	providerType  string
 	oaiModel      string
 	oaiURL        string
 	encoding      string
@@ -269,9 +269,10 @@ func init() {
 	rootCmd.Flags().IntVar(&batchTokens, "tokens", siftrank.DefaultBatchTokens, "max tokens per batch")
 	rootCmd.Flags().Float64Var(&refinementRatio, "ratio", siftrank.DefaultRefinementRatio, "refinement ratio (0.0-1.0, e.g. 0.5 = top 50%)")
 
-	// Model parameter flags
-	rootCmd.Flags().StringVarP(&oaiModel, "model", "m", openai.ChatModelGPT4oMini, "OpenAI model name")
-	rootCmd.Flags().StringVarP(&oaiURL, "base-url", "u", "", "OpenAI API base URL (for compatible APIs like vLLM)")
+	// Provider/Model parameter flags
+	rootCmd.Flags().StringVar(&providerType, "provider", "openai", "LLM provider: openai, anthropic, openrouter, ollama, google")
+	rootCmd.Flags().StringVarP(&oaiModel, "model", "m", "gpt-4o-mini", "model name (provider-specific)")
+	rootCmd.Flags().StringVarP(&oaiURL, "base-url", "u", "", "custom API base URL (for vLLM, Ollama, etc.)")
 	rootCmd.Flags().StringVar(&encoding, "encoding", siftrank.DefaultEncoding, "tokenizer encoding")
 	rootCmd.Flags().StringVarP(&effort, "effort", "e", "", "reasoning effort level: none, minimal, low, medium, high")
 	rootCmd.Flags().StringVar(&compareModels, "compare", "", "compare multiple models (format: \"provider:model,provider:model\")")
@@ -303,10 +304,28 @@ func init() {
 	rootCmd.SetUsageTemplate(usageTemplate)
 
 	// Organize flags into groups
-	setFlagGroup(rootCmd, "options", "file", "prompt", "output", "model", "relevance", "compare", "pattern")
+	setFlagGroup(rootCmd, "options", "file", "prompt", "output", "provider", "model", "relevance", "compare", "pattern")
 	setFlagGroup(rootCmd, "visualization", "watch", "no-minimap")
 	setFlagGroup(rootCmd, "debug", "trace", "debug", "dry-run", "log")
 	setFlagGroup(rootCmd, "advanced", "template", "json", "base-url", "encoding", "effort", "tokens", "batch-size", "max-trials", "concurrency", "ratio", "no-converge", "elbow-tolerance", "stable-trials", "min-trials", "elbow-method")
+}
+
+// resolveAPIKey returns the appropriate API key environment variable for a provider type.
+func resolveAPIKey(pt siftrank.ProviderType) string {
+	switch pt {
+	case siftrank.ProviderTypeOpenAI:
+		return os.Getenv("OPENAI_API_KEY")
+	case siftrank.ProviderTypeAnthropic:
+		return os.Getenv("ANTHROPIC_API_KEY")
+	case siftrank.ProviderTypeOpenRouter:
+		return os.Getenv("OPENROUTER_API_KEY")
+	case siftrank.ProviderTypeGoogle:
+		return os.Getenv("GOOGLE_API_KEY")
+	case siftrank.ProviderTypeOllama:
+		return os.Getenv("OLLAMA_API_KEY") // optional for Ollama
+	default:
+		return ""
+	}
 }
 
 func run(cmd *cobra.Command, args []string) error {
@@ -360,16 +379,35 @@ func run(cmd *cobra.Command, args []string) error {
 		userPrompt = string(content)
 	}
 
+	// Resolve API key based on provider type
+	apiKey := resolveAPIKey(siftrank.ProviderType(providerType))
+
+	// Create provider via factory (unless compare mode handles it)
+	var provider siftrank.LLMProvider
+	if compareModels == "" {
+		var err error
+		provider, err = siftrank.NewProvider(siftrank.ProviderConfig{
+			Type:     siftrank.ProviderType(providerType),
+			APIKey:   apiKey,
+			Model:    oaiModel,
+			BaseURL:  oaiURL,
+			Encoding: encoding,
+			Effort:   effort,
+			Logger:   logger,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create %s provider: %w", providerType, err)
+		}
+	}
+
 	// Create config
 	config := &siftrank.Config{
 		InitialPrompt:   userPrompt,
 		BatchSize:       batchSize,
 		NumTrials:       maxTrials,
 		Concurrency:     concurrency,
-		OpenAIModel:     oaiModel,
+		LLMProvider:     provider,
 		RefinementRatio: refinementRatio,
-		OpenAIKey:       os.Getenv("OPENAI_API_KEY"),
-		OpenAIAPIURL:    oaiURL,
 		Encoding:        encoding,
 		BatchTokens:     batchTokens,
 		DryRun:          dryRun,
