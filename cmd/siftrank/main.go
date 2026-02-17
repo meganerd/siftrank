@@ -170,6 +170,7 @@ var (
 	encoding      string
 	effort        string
 	compareModels string
+	apiKey        string
 
 	// Convergence params
 	noConverge     bool
@@ -277,6 +278,7 @@ func init() {
 	rootCmd.Flags().StringVar(&encoding, "encoding", siftrank.DefaultEncoding, "tokenizer encoding")
 	rootCmd.Flags().StringVarP(&effort, "effort", "e", "", "reasoning effort level: none, minimal, low, medium, high")
 	rootCmd.Flags().StringVar(&compareModels, "compare", "", "compare multiple models (format: \"provider:model,provider:model\")")
+	rootCmd.Flags().StringVar(&apiKey, "api-key", "", "API key (overrides provider-specific env vars)")
 
 	// Convergence parameter flags
 	rootCmd.Flags().BoolVar(&noConverge, "no-converge", false, "disable early stopping based on convergence")
@@ -306,7 +308,7 @@ func init() {
 	rootCmd.SetUsageTemplate(usageTemplate)
 
 	// Organize flags into groups
-	setFlagGroup(rootCmd, "options", "file", "prompt", "output", "provider", "model", "relevance", "compare", "pattern", "report-cost")
+	setFlagGroup(rootCmd, "options", "file", "prompt", "output", "provider", "model", "api-key", "relevance", "compare", "pattern", "report-cost")
 	setFlagGroup(rootCmd, "visualization", "watch", "no-minimap")
 	setFlagGroup(rootCmd, "debug", "trace", "debug", "dry-run", "log")
 	setFlagGroup(rootCmd, "advanced", "template", "json", "base-url", "encoding", "effort", "tokens", "batch-size", "max-trials", "concurrency", "ratio", "no-converge", "elbow-tolerance", "stable-trials", "min-trials", "elbow-method")
@@ -381,8 +383,11 @@ func run(cmd *cobra.Command, args []string) error {
 		userPrompt = string(content)
 	}
 
-	// Resolve API key based on provider type
-	apiKey := resolveAPIKey(siftrank.ProviderType(providerType))
+	// Resolve API key: --api-key flag takes precedence over env vars
+	resolvedKey := apiKey
+	if resolvedKey == "" {
+		resolvedKey = resolveAPIKey(siftrank.ProviderType(providerType))
+	}
 
 	// Create provider via factory (unless compare mode handles it)
 	var provider siftrank.LLMProvider
@@ -390,7 +395,7 @@ func run(cmd *cobra.Command, args []string) error {
 		var err error
 		provider, err = siftrank.NewProvider(siftrank.ProviderConfig{
 			Type:     siftrank.ProviderType(providerType),
-			APIKey:   apiKey,
+			APIKey:   resolvedKey,
 			Model:    oaiModel,
 			BaseURL:  oaiURL,
 			Encoding: encoding,
