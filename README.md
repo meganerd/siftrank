@@ -78,6 +78,7 @@ Options:
       --provider string   LLM provider: openai, anthropic, openrouter, ollama, google (default "openai")
   -r, --relevance         post-process each item by providing relevance justification (skips round 1)
       --compare string    compare multiple models (format: "provider:model,provider:model")
+      --report-cost       print estimated cost summary to stderr after ranking
 
 Visualization:
       --no-minimap   disable minimap panel in watch mode
@@ -104,7 +105,7 @@ Advanced:
       --ratio float             refinement ratio (0.0-1.0, e.g. 0.5 = top 50%) (default 0.5)
       --stable-trials int       stable trials required for convergence (default 5)
       --template string         template for each object (prefix with @ to use a file) (default "{{.Data}}")
-      --tokens int              max tokens per batch (default 128000)
+      --tokens int              max tokens per batch (includes prompt + documents) (default 128000)
 
 Flags:
   -h, --help   help for siftrank
@@ -595,6 +596,8 @@ Every LLM API call records:
 
 Token usage accumulates across all trials and is included in the trace file (see `--trace` flag).
 
+> **Note:** The `--tokens` budget applies to each batch as a whole, including the ranking prompt and document content combined. When adjusting `--tokens`, account for your prompt length — larger prompts leave less room for documents per batch.
+
 ##### Model Comparison with --compare
 
 Compare multiple models side-by-side to evaluate performance and cost tradeoffs:
@@ -682,7 +685,7 @@ Cost = (50,000 / 1,000,000) × $0.15 + (10,000 / 1,000,000) × $0.60
      = $0.0135 (~1.4 cents)
 ```
 
-> **Note:** Built-in cost reporting (automatic $ calculation) is planned for a future release. Track progress in issue siftrank-20.
+> **Tip:** Use `--report-cost` for built-in cost reporting. It prints a cost summary (model, tokens, estimated cost in USD) to stderr after ranking completes.
 
 </details>
 
@@ -713,16 +716,16 @@ While building on the foundational algorithm from Raink, this implementation div
 ### To-do
 
 - [ ] add python bindings?
-- [ ] allow specifying an input _directory_ (where each file is distinct object)
-- [ ] clarify when prompt included in token estimate
 - [ ] factor LLM calls out into a separate package
 - [ ] run openai batch mode
-- [ ] report cost + token usage
 - [ ] add more examples, use cases
 - [ ] account for reasoning tokens separately
 
 <details><summary>Completed</summary>
 
+- [x] allow specifying an input directory (where each file is distinct object)
+- [x] clarify when prompt included in token estimate
+- [x] report cost + token usage
 - [x] add visualization
 - [x] support reasoning effort
 - [x] add blog link
