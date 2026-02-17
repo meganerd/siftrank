@@ -67,7 +67,7 @@ func NewProvider(cfg ProviderConfig) (LLMProvider, error) {
 	case ProviderTypeAnthropic:
 		return newAnthropicProvider(cfg, logger)
 	case ProviderTypeGoogle:
-		return nil, fmt.Errorf("google provider not yet implemented")
+		return newGoogleProvider(cfg, logger)
 	case ProviderTypeOllama:
 		return newOllamaProvider(cfg, logger)
 	default:
@@ -149,6 +149,25 @@ func newOllamaProvider(cfg ProviderConfig, logger *slog.Logger) (LLMProvider, er
 		BaseURL:  cfg.BaseURL,
 		Encoding: encoding,
 		Effort:   cfg.Effort,
+		Logger:   logger,
+	})
+}
+
+// newGoogleProvider creates a provider for Google Gemini
+func newGoogleProvider(cfg ProviderConfig, logger *slog.Logger) (LLMProvider, error) {
+	if cfg.APIKey == "" {
+		return nil, fmt.Errorf("google provider requires an API key")
+	}
+
+	encoding := cfg.Encoding
+	if encoding == "" {
+		encoding = DefaultEncoding
+	}
+
+	return NewGoogleProvider(GoogleConfig{
+		APIKey:   cfg.APIKey,
+		Model:    cfg.Model,
+		Encoding: encoding,
 		Logger:   logger,
 	})
 }
