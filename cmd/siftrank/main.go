@@ -267,7 +267,7 @@ func init() {
 	rootCmd.Flags().IntVarP(&batchSize, "batch-size", "b", siftrank.DefaultBatchSize, "number of items per batch")
 	rootCmd.Flags().IntVar(&maxTrials, "max-trials", siftrank.DefaultNumTrials, "maximum number of ranking trials")
 	rootCmd.Flags().IntVarP(&concurrency, "concurrency", "c", siftrank.DefaultConcurrency, "max concurrent LLM calls across all trials")
-	rootCmd.Flags().IntVar(&batchTokens, "tokens", siftrank.DefaultBatchTokens, "max tokens per batch")
+	rootCmd.Flags().IntVar(&batchTokens, "tokens", siftrank.DefaultBatchTokens, "max tokens per batch (includes prompt + documents)")
 	rootCmd.Flags().Float64Var(&refinementRatio, "ratio", siftrank.DefaultRefinementRatio, "refinement ratio (0.0-1.0, e.g. 0.5 = top 50%)")
 
 	// Provider/Model parameter flags
