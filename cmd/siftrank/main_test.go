@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/meganerd/siftrank/pkg/siftrank"
 )
 
 // TestEnumerateFiles_GlobPattern tests glob pattern matching
@@ -605,6 +607,49 @@ func TestLargeDirectory_Integration_GlobFiltering(t *testing.T) {
 	}
 	if len(docFiles) != 500 {
 		t.Errorf("Expected 500 doc*.txt files, got %d", len(docFiles))
+	}
+}
+
+// TestAPIKeyFlag tests that --api-key flag is registered and parsed
+func TestAPIKeyFlag(t *testing.T) {
+	f := rootCmd.Flags().Lookup("api-key")
+	if f == nil {
+		t.Fatal("--api-key flag not registered")
+	}
+	if f.DefValue != "" {
+		t.Errorf("Expected empty default for --api-key, got %q", f.DefValue)
+	}
+}
+
+// TestResolveAPIKey_AllProviders tests env var resolution for each provider
+func TestResolveAPIKey_AllProviders(t *testing.T) {
+	tests := []struct {
+		provider string
+		envVar   string
+	}{
+		{"openai", "OPENAI_API_KEY"},
+		{"anthropic", "ANTHROPIC_API_KEY"},
+		{"openrouter", "OPENROUTER_API_KEY"},
+		{"google", "GOOGLE_API_KEY"},
+		{"ollama", "OLLAMA_API_KEY"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.provider, func(t *testing.T) {
+			t.Setenv(tc.envVar, "test-key-"+tc.provider)
+			key := resolveAPIKey(siftrank.ProviderType(tc.provider))
+			if key != "test-key-"+tc.provider {
+				t.Errorf("resolveAPIKey(%s) = %q, want %q", tc.provider, key, "test-key-"+tc.provider)
+			}
+		})
+	}
+}
+
+// TestResolveAPIKey_UnknownProvider tests that unknown providers return empty string
+func TestResolveAPIKey_UnknownProvider(t *testing.T) {
+	key := resolveAPIKey(siftrank.ProviderType("unknown"))
+	if key != "" {
+		t.Errorf("resolveAPIKey(unknown) = %q, want empty", key)
 	}
 }
 
