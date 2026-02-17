@@ -144,17 +144,17 @@ func TestNewProvider_OllamaMissingBaseURL(t *testing.T) {
 	}
 }
 
-func TestNewProvider_UnimplementedProvider(t *testing.T) {
+func TestNewProvider_UnknownProvider(t *testing.T) {
 	cfg := ProviderConfig{
-		Type:     ProviderTypeGoogle,
+		Type:     ProviderType("nonexistent"),
 		APIKey:   "test-key",
-		Model:    "gemini-pro",
+		Model:    "some-model",
 		Encoding: "o200k_base",
 	}
 
 	_, err := NewProvider(cfg)
 	if err == nil {
-		t.Fatal("Expected error for unimplemented Google provider")
+		t.Fatal("Expected error for unknown provider type")
 	}
 }
 
