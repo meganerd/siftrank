@@ -188,6 +188,10 @@ var (
 	noMinimap  bool
 	logFile    string
 	reportCost bool
+
+	// Config
+	configPath string
+	appConfig  Config
 )
 
 // setFlagGroup annotates flags with a group name for organized help output.
@@ -247,10 +251,49 @@ Flags:
 var rootCmd = &cobra.Command{
 	Use:   "siftrank",
 	Short: "Use LLMs for document ranking via the SiftRank algorithm",
-	RunE:  run,
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		// Load config file
+		cfgPath := configPath
+		if cfgPath == "" {
+			cfgPath = defaultConfigPath()
+		}
+		appConfig = loadConfig(cfgPath)
+
+		// Apply config defaults to flags that weren't explicitly set (CLI > env > config)
+		applyConfigDefaults(cmd)
+		return nil
+	},
+	RunE: run,
+}
+
+// applyConfigDefaults sets flag values from config for flags not explicitly set on the command line.
+func applyConfigDefaults(cmd *cobra.Command) {
+	setDefault := func(name, value string) {
+		if value == "" {
+			return
+		}
+		f := cmd.Flags().Lookup(name)
+		if f != nil && !f.Changed {
+			_ = f.Value.Set(value)
+		}
+	}
+
+	setDefault("provider", appConfig.Provider)
+	setDefault("model", appConfig.Model)
+	setDefault("base-url", appConfig.BaseURL)
+	// api-key from config only if no CLI flag and no env var
+	if apiKey == "" {
+		f := cmd.Flags().Lookup("api-key")
+		if f != nil && !f.Changed && appConfig.APIKey != "" {
+			_ = f.Value.Set(appConfig.APIKey)
+		}
+	}
 }
 
 func init() {
+	// Config flag (persistent — available to all subcommands)
+	rootCmd.PersistentFlags().StringVar(&configPath, "config", "", "config file path (default: $XDG_CONFIG_HOME/siftrank/config.yaml)")
+
 	// Input/Output flags
 	rootCmd.Flags().StringVarP(&inputFile, "file", "f", "", "input file (required)")
 	rootCmd.Flags().BoolVar(&forceJSON, "json", false, "force JSON parsing regardless of file extension")
@@ -314,22 +357,27 @@ func init() {
 	setFlagGroup(rootCmd, "advanced", "template", "json", "base-url", "encoding", "effort", "tokens", "batch-size", "max-trials", "concurrency", "ratio", "no-converge", "elbow-tolerance", "stable-trials", "min-trials", "elbow-method")
 }
 
-// resolveAPIKey returns the appropriate API key environment variable for a provider type.
+// resolveAPIKey returns the appropriate API key for a provider type.
+// Precedence: env var > config per-provider key > empty.
 func resolveAPIKey(pt siftrank.ProviderType) string {
+	var envKey string
 	switch pt {
 	case siftrank.ProviderTypeOpenAI:
-		return os.Getenv("OPENAI_API_KEY")
+		envKey = os.Getenv("OPENAI_API_KEY")
 	case siftrank.ProviderTypeAnthropic:
-		return os.Getenv("ANTHROPIC_API_KEY")
+		envKey = os.Getenv("ANTHROPIC_API_KEY")
 	case siftrank.ProviderTypeOpenRouter:
-		return os.Getenv("OPENROUTER_API_KEY")
+		envKey = os.Getenv("OPENROUTER_API_KEY")
 	case siftrank.ProviderTypeGoogle:
-		return os.Getenv("GOOGLE_API_KEY")
+		envKey = os.Getenv("GOOGLE_API_KEY")
 	case siftrank.ProviderTypeOllama:
-		return os.Getenv("OLLAMA_API_KEY") // optional for Ollama
-	default:
-		return ""
+		envKey = os.Getenv("OLLAMA_API_KEY")
 	}
+	if envKey != "" {
+		return envKey
+	}
+	// Fall back to config file per-provider keys
+	return resolveAPIKeyFromConfig(appConfig, string(pt))
 }
 
 func run(cmd *cobra.Command, args []string) error {
