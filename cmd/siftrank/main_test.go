@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -607,6 +608,112 @@ func TestLargeDirectory_Integration_GlobFiltering(t *testing.T) {
 	}
 	if len(docFiles) != 500 {
 		t.Errorf("Expected 500 doc*.txt files, got %d", len(docFiles))
+	}
+}
+
+// File Descriptor (FD) Passing Tests — siftrank-47
+// Tests verify TOCTOU mitigation via file descriptor passing from validateInputPath.
+
+// TestFDPassing_FileContentReadable verifies the FD returned by validateInputPath
+// can be used to read file content (proving the FD is valid and usable).
+func TestFDPassing_FileContentReadable(t *testing.T) {
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "readable.txt")
+	expected := "hello from FD test"
+	if err := os.WriteFile(testFile, []byte(expected), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fd, isDir, err := validateInputPath(testFile)
+	if err != nil {
+		t.Fatalf("validateInputPath: %v", err)
+	}
+	defer fd.Close()
+
+	if isDir {
+		t.Fatal("expected isDir=false for file")
+	}
+
+	// Read content through the FD
+	content, err := io.ReadAll(fd)
+	if err != nil {
+		t.Fatalf("reading from FD: %v", err)
+	}
+	if string(content) != expected {
+		t.Errorf("FD content = %q, want %q", string(content), expected)
+	}
+}
+
+// TestFDPassing_FDNameMatchesPath verifies that FD.Name() returns a path
+// that can be used to identify the file (used for extension detection, error messages).
+func TestFDPassing_FDNameMatchesPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "named.json")
+	if err := os.WriteFile(testFile, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fd, _, err := validateInputPath(testFile)
+	if err != nil {
+		t.Fatalf("validateInputPath: %v", err)
+	}
+	defer fd.Close()
+
+	// FD.Name() should contain the file name (used for extension detection in loadDocumentsFromFile)
+	if !strings.HasSuffix(fd.Name(), "named.json") {
+		t.Errorf("FD.Name() = %q, expected to end with 'named.json'", fd.Name())
+	}
+}
+
+// TestFDPassing_DirectoryFDStat verifies directory FDs can be Stat'd
+// (used in the isDir check path of validateInputPath).
+func TestFDPassing_DirectoryFDStat(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	fd, isDir, err := validateInputPath(tmpDir)
+	if err != nil {
+		t.Fatalf("validateInputPath: %v", err)
+	}
+	defer fd.Close()
+
+	if !isDir {
+		t.Fatal("expected isDir=true for directory")
+	}
+
+	// Verify the FD can be Stat'd (proving the FD is valid)
+	info, err := fd.Stat()
+	if err != nil {
+		t.Fatalf("fd.Stat(): %v", err)
+	}
+	if !info.IsDir() {
+		t.Error("fd.Stat().IsDir() = false, want true")
+	}
+}
+
+// TestFDPassing_PermissionDenied verifies validateInputPath returns a clear error
+// when file permissions prevent opening (FD not leaked on error).
+func TestFDPassing_PermissionDenied(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("skipping permission test as root")
+	}
+
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "noperm.txt")
+	if err := os.WriteFile(testFile, []byte("secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Remove read permission
+	if err := os.Chmod(testFile, 0000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(testFile, 0600) })
+
+	_, _, err := validateInputPath(testFile)
+	if err == nil {
+		t.Fatal("expected error for permission denied")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("expected 'permission denied' error, got: %v", err)
 	}
 }
 

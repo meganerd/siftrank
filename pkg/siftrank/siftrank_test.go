@@ -537,6 +537,304 @@ func TestRankFromFiles_ExceedsDocumentLimit(t *testing.T) {
 }
 
 // TestRankFromFiles_AtDocumentLimit tests success when document count equals limit
+// File Descriptor (FD) Passing Tests — siftrank-47
+// Tests verify the TOCTOU mitigation via file descriptor passing through the full chain.
+
+// TestLoadDocumentsFromFile_WithFD verifies that a pre-opened file descriptor
+// is used directly without opening the file again.
+func TestLoadDocumentsFromFile_WithFD(t *testing.T) {
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "fd_test.txt")
+	if err := os.WriteFile(testFile, []byte("alpha\nbeta\ngamma\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-open the file (simulating validateInputPath behavior)
+	fd, err := os.Open(testFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fd.Close()
+
+	config := &Config{
+		InitialPrompt:   "test",
+		BatchSize:       5,
+		NumTrials:       1,
+		Concurrency:     1,
+		OpenAIModel:     openai.ChatModelGPT4oMini,
+		RefinementRatio: 0.0,
+		OpenAIKey:       "test-key",
+		Encoding:        "o200k_base",
+		BatchTokens:     2000,
+		DryRun:          true,
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		LogLevel:        slog.LevelInfo,
+	}
+
+	ranker, err := NewRanker(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	docs, err := ranker.loadDocumentsFromFile(testFile, fd, "{{.Data}}", false)
+	if err != nil {
+		t.Fatalf("loadDocumentsFromFile with FD: unexpected error: %v", err)
+	}
+
+	if len(docs) != 3 {
+		t.Fatalf("expected 3 documents, got %d", len(docs))
+	}
+	if docs[0].Value != "alpha" {
+		t.Errorf("doc[0].value = %q, want %q", docs[0].Value, "alpha")
+	}
+	if docs[1].Value != "beta" {
+		t.Errorf("doc[1].value = %q, want %q", docs[1].Value, "beta")
+	}
+	if docs[2].Value != "gamma" {
+		t.Errorf("doc[2].value = %q, want %q", docs[2].Value, "gamma")
+	}
+}
+
+// TestLoadDocumentsFromFile_NilFD verifies that nil FD falls back to
+// opening the file from the path (backward compatibility).
+func TestLoadDocumentsFromFile_NilFD(t *testing.T) {
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "nilfd_test.txt")
+	if err := os.WriteFile(testFile, []byte("one\ntwo\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	config := &Config{
+		InitialPrompt:   "test",
+		BatchSize:       5,
+		NumTrials:       1,
+		Concurrency:     1,
+		OpenAIModel:     openai.ChatModelGPT4oMini,
+		RefinementRatio: 0.0,
+		OpenAIKey:       "test-key",
+		Encoding:        "o200k_base",
+		BatchTokens:     2000,
+		DryRun:          true,
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		LogLevel:        slog.LevelInfo,
+	}
+
+	ranker, err := NewRanker(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Pass nil FD — should fall back to opening from path
+	docs, err := ranker.loadDocumentsFromFile(testFile, nil, "{{.Data}}", false)
+	if err != nil {
+		t.Fatalf("loadDocumentsFromFile with nil FD: unexpected error: %v", err)
+	}
+
+	if len(docs) != 2 {
+		t.Fatalf("expected 2 documents, got %d", len(docs))
+	}
+	if docs[0].Value != "one" {
+		t.Errorf("doc[0].value = %q, want %q", docs[0].Value, "one")
+	}
+}
+
+// TestLoadDocumentsFromFile_ClosedFD verifies that a closed file descriptor
+// returns an error rather than silently succeeding.
+func TestLoadDocumentsFromFile_ClosedFD(t *testing.T) {
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "closed_fd.txt")
+	if err := os.WriteFile(testFile, []byte("data\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open and immediately close the FD
+	fd, err := os.Open(testFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd.Close() // Intentionally close before passing
+
+	config := &Config{
+		InitialPrompt:   "test",
+		BatchSize:       5,
+		NumTrials:       1,
+		Concurrency:     1,
+		OpenAIModel:     openai.ChatModelGPT4oMini,
+		RefinementRatio: 0.0,
+		OpenAIKey:       "test-key",
+		Encoding:        "o200k_base",
+		BatchTokens:     2000,
+		DryRun:          true,
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		LogLevel:        slog.LevelInfo,
+	}
+
+	ranker, err := NewRanker(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = ranker.loadDocumentsFromFile(testFile, fd, "{{.Data}}", false)
+	if err == nil {
+		t.Fatal("expected error for closed FD, got nil")
+	}
+}
+
+// TestRankFromFile_WithFD_DryRun tests the full FD passing chain from
+// RankFromFile through loadDocumentsFromFile using a pre-opened descriptor.
+func TestRankFromFile_WithFD_DryRun(t *testing.T) {
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "fd_rank.txt")
+	if err := os.WriteFile(testFile, []byte("foo\nbar\nbaz\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-open FD (simulating validateInputPath)
+	fd, err := os.Open(testFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fd.Close()
+
+	config := &Config{
+		InitialPrompt:   "Rank alphabetically",
+		BatchSize:       3,
+		NumTrials:       1,
+		Concurrency:     20,
+		OpenAIModel:     openai.ChatModelGPT4oMini,
+		RefinementRatio: 0.0,
+		OpenAIKey:       "test-key",
+		Encoding:        "o200k_base",
+		BatchTokens:     2000,
+		DryRun:          true,
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		LogLevel:        slog.LevelInfo,
+	}
+
+	ranker, err := NewRanker(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := ranker.RankFromFile(testFile, fd, "{{.Data}}", false)
+	if err != nil {
+		t.Fatalf("RankFromFile with FD: unexpected error: %v", err)
+	}
+
+	if len(results) < 2 {
+		t.Errorf("expected at least 2 results, got %d", len(results))
+	}
+
+	// Verify results have required fields
+	for i, r := range results {
+		if r.Key == "" {
+			t.Errorf("result[%d] missing Key", i)
+		}
+		if r.Value == "" {
+			t.Errorf("result[%d] missing Value", i)
+		}
+	}
+}
+
+// TestRankFromFiles_FDPerFile verifies that RankFromFiles opens each file
+// independently and passes FDs to loadDocumentsFromFile.
+func TestRankFromFiles_FDPerFile(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create 3 separate files
+	file1 := filepath.Join(tmpDir, "a.txt")
+	file2 := filepath.Join(tmpDir, "b.txt")
+	file3 := filepath.Join(tmpDir, "c.txt")
+	if err := os.WriteFile(file1, []byte("alpha\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file2, []byte("beta\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file3, []byte("gamma\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	config := &Config{
+		InitialPrompt:   "Rank",
+		BatchSize:       5,
+		NumTrials:       1,
+		Concurrency:     20,
+		OpenAIModel:     openai.ChatModelGPT4oMini,
+		RefinementRatio: 0.0,
+		OpenAIKey:       "test-key",
+		Encoding:        "o200k_base",
+		BatchTokens:     2000,
+		DryRun:          true,
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		LogLevel:        slog.LevelInfo,
+	}
+
+	ranker, err := NewRanker(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := ranker.RankFromFiles([]string{file1, file2, file3}, "{{.Data}}", false)
+	if err != nil {
+		t.Fatalf("RankFromFiles: unexpected error: %v", err)
+	}
+
+	// Should have 3 documents (one per file, one line each)
+	if len(results) != 3 {
+		t.Errorf("expected 3 results, got %d", len(results))
+	}
+
+	// Verify all values present
+	values := make(map[string]bool)
+	for _, r := range results {
+		values[r.Value] = true
+	}
+	for _, want := range []string{"alpha", "beta", "gamma"} {
+		if !values[want] {
+			t.Errorf("missing expected value %q in results", want)
+		}
+	}
+}
+
+// TestRankFromFiles_NonExistentFile verifies error when one file in
+// the list doesn't exist (FD open fails).
+func TestRankFromFiles_NonExistentFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	validFile := filepath.Join(tmpDir, "valid.txt")
+	if err := os.WriteFile(validFile, []byte("data\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	config := &Config{
+		InitialPrompt:   "Rank",
+		BatchSize:       5,
+		NumTrials:       1,
+		Concurrency:     1,
+		OpenAIModel:     openai.ChatModelGPT4oMini,
+		RefinementRatio: 0.0,
+		OpenAIKey:       "test-key",
+		Encoding:        "o200k_base",
+		BatchTokens:     2000,
+		DryRun:          true,
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		LogLevel:        slog.LevelInfo,
+	}
+
+	ranker, err := NewRanker(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = ranker.RankFromFiles([]string{validFile, "/nonexistent/file.txt"}, "{{.Data}}", false)
+	if err == nil {
+		t.Fatal("expected error for non-existent file in list")
+	}
+	if !strings.Contains(err.Error(), "failed to open") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
 func TestRankFromFiles_AtDocumentLimit(t *testing.T) {
 	tmpDir := t.TempDir()
 
