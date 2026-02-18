@@ -30,7 +30,7 @@ Use any LLM to rank anything. No fine-tuning. No domain-specific models. Just an
 - **OpenAI** - GPT-4, GPT-4o, GPT-4o-mini (via `OPENAI_API_KEY`)
 - **Anthropic** - Claude Opus, Claude Sonnet, Claude Haiku (via `ANTHROPIC_API_KEY`)
 - **OpenRouter** - Access 200+ models from multiple providers (via `OPENROUTER_API_KEY`)
-- **Ollama** - Local models like Llama, Mistral, Qwen (via local Ollama server)
+- **Ollama** - Local or cloud-hosted models like Llama, Mistral, Qwen (via `OLLAMA_API_KEY` for cloud, no key for local)
 - **Google** - Gemini Pro, Gemini Flash (via `GOOGLE_API_KEY`)
 
 Select your provider with `--provider <name>` or use the default (OpenAI). Set the appropriate API key environment variable for your chosen provider.
@@ -60,8 +60,11 @@ export OPENROUTER_API_KEY="sk-or-..."
 # Google
 export GOOGLE_API_KEY="..."
 
-# Ollama (runs locally, no API key needed)
+# Ollama (local — no API key needed)
 # Ensure Ollama server is running: ollama serve
+
+# Ollama (cloud-hosted — requires API key)
+export OLLAMA_API_KEY="..."
 ```
 
 ### Usage
@@ -241,7 +244,11 @@ siftrank \
     --compare "openrouter:anthropic/claude-sonnet-4,openrouter:openai/gpt-4o"
 ```
 
-#### Ollama (Local Models)
+#### Ollama (Local & Cloud)
+
+`siftrank` supports both local and cloud-hosted Ollama instances. Local instances require no API key; cloud instances authenticate via `OLLAMA_API_KEY` using Bearer token auth.
+
+**Authentication precedence:** `--api-key` flag > `OLLAMA_API_KEY` env var > config `api_keys.ollama` > no auth (local).
 
 **Run completely local with Llama:**
 ```bash
@@ -251,6 +258,7 @@ siftrank \
 siftrank \
     --provider ollama \
     --model llama3.3 \
+    --base-url http://localhost:11434 \
     -f sensitive_data.txt \
     -p 'Identify PII that needs redaction.' \
     -o redaction_candidates.json
@@ -266,11 +274,39 @@ siftrank \
     -p 'Rank code by complexity and maintainability.'
 ```
 
+**Cloud-hosted Ollama instance:**
+```bash
+# Set API key for cloud-hosted Ollama
+export OLLAMA_API_KEY="your-cloud-api-key"
+
+siftrank \
+    --provider ollama \
+    --model llama3.3 \
+    --base-url https://ollama.example.com \
+    -f documents.txt \
+    -p 'Rank by relevance to security compliance.'
+```
+
+**Using a config file for cloud Ollama:**
+```yaml
+# ~/.config/siftrank/config.yaml
+provider: ollama
+model: llama3.3
+base_url: https://ollama.example.com
+api_keys:
+  ollama: your-cloud-api-key
+```
+```bash
+# With config file, no flags needed:
+siftrank -f documents.txt -p 'Rank by relevance.'
+```
+
 **Local model for privacy-sensitive ranking:**
 ```bash
 siftrank \
     --provider ollama \
     --model mistral:7b-instruct \
+    --base-url http://localhost:11434 \
     -f employee_reviews.txt \
     -p 'Identify reviews mentioning management concerns.' \
     --no-converge \
@@ -672,7 +708,8 @@ jq -s 'map({model, input: .input_tokens, output: .output_tokens}) | group_by(.mo
 | Anthropic | claude-haiku-4 | $0.25 | $1.25 |
 | Anthropic | claude-sonnet-4 | $3.00 | $15.00 |
 | OpenRouter | varies | varies | varies |
-| Ollama | free (local) | $0.00 | $0.00 |
+| Ollama (local) | free | $0.00 | $0.00 |
+| Ollama (cloud) | varies by provider | varies | varies |
 
 **Example cost calculation:**
 ```
