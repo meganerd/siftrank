@@ -35,6 +35,23 @@ Use any LLM to rank anything. No fine-tuning. No domain-specific models. Just an
 
 Select your provider with `--provider <name>` or use the default (OpenAI). Set the appropriate API key environment variable for your chosen provider.
 
+#### Choosing a Provider
+
+| Provider | Best For | Strengths | Considerations |
+|----------|----------|-----------|----------------|
+| **OpenAI** | General use, batch mode | Fast, cost-effective (gpt-4o-mini), batch API (50% savings), widest model range | Requires API key, cloud-only |
+| **Anthropic** | Complex analysis, nuance | Strong reasoning (Claude Sonnet/Opus), careful instruction following | Higher cost for top-tier models |
+| **OpenRouter** | Model experimentation | Access 200+ models, single API key, easy model comparison | Adds routing layer, pricing varies by model |
+| **Ollama** | Privacy, local control | Free local inference, no data leaves your machine, cloud option available | Requires local GPU for good performance, slower than cloud APIs |
+| **Google** | Google ecosystem | Gemini models, competitive pricing | Smaller model selection for ranking tasks |
+
+**Quick decision guide:**
+- **Just getting started?** Use OpenAI with `gpt-4o-mini` (default). Cheapest cloud option with great results.
+- **Need privacy?** Use Ollama with a local model. No data leaves your machine.
+- **Large dataset (1000+ docs)?** Use `siftrank batch submit` with OpenAI for 50% cost savings.
+- **Want the best quality?** Use Anthropic with `claude-sonnet-4-20250514` or OpenAI with `gpt-4o`.
+- **Comparing models?** Use OpenRouter with `--compare` to test multiple models through one API key.
+
 ## Getting started
 
 ### Install
@@ -135,6 +152,64 @@ siftrank \
    8  The stars twinkled brightly in the clear night sky.
    9  He spotted a shooting star while stargazing.
   10  She opened the curtains to let in the morning light.
+```
+
+#### Understanding the Output
+
+`siftrank` outputs a JSON array of ranked documents, sorted by score (lower = better):
+
+```json
+[
+  {
+    "key": "eQJpm-Qs",
+    "value": "The train arrived exactly on time.",
+    "score": 1.5,
+    "rank": 1,
+    "input_index": 0
+  },
+  {
+    "key": "SyJ3d9Td",
+    "value": "The old clock chimed twelve times.",
+    "score": 2.3,
+    "rank": 2,
+    "input_index": 5
+  }
+]
+```
+
+| Field | Description |
+|-------|-------------|
+| `key` | Deterministic short ID for the document |
+| `value` | The document text (or rendered template output) |
+| `score` | Average positional score across trials (lower = more relevant) |
+| `rank` | Final rank position (1 = best match) |
+| `input_index` | Original position in the input file (0-indexed) |
+
+**Common output recipes:**
+
+```bash
+# Top 5 values only
+siftrank -f data.txt -p 'Rank by relevance' | jq -r '.[:5] | map(.value)[]'
+
+# Top 10 as numbered list
+siftrank -f data.txt -p 'Rank by quality' | jq -r '.[:10] | map(.value)[]' | nl
+
+# Save full results to file
+siftrank -f data.txt -p 'Rank by importance' -o results.json
+
+# Get built-in cost report
+siftrank -f data.txt -p 'Rank by priority' --report-cost
+```
+
+The `--report-cost` flag prints a cost summary to stderr after ranking:
+
+```
+--- Cost Report ---
+Model:         gpt-4o-mini
+Input tokens:  48250
+Output tokens: 9830
+Estimated cost: $0.013125
+-------------------
 ```
 
 Use a different provider by specifying `--provider` and `--model`:
@@ -505,6 +580,75 @@ siftrank \
 
 **Note:** Relevance mode skips initial trial round (jumps directly to justification), so use with a reasonable `--max-trials` limit.
 
+#### Batch Mode (OpenAI Batch API)
+
+Submit large ranking jobs to the OpenAI Batch API for **50% cost savings**. Batch jobs complete within 24 hours — ideal for large, cost-sensitive datasets where real-time results are not required.
+
+**Subcommands:**
+
+```
+siftrank batch submit   Submit a batch ranking job
+siftrank batch status   Check the status of a batch job
+siftrank batch results  Download and process results from a completed batch job
+```
+
+**End-to-end workflow:**
+
+```bash
+# Step 1: Submit a batch job
+siftrank batch submit \
+    -f documents.txt \
+    -p 'Rank by business value' \
+    -m gpt-4o-mini \
+    -o ./output
+
+# Output:
+#   Loaded 500 documents from documents.txt
+#   Generated 50 batch requests
+#   Uploaded batch file: file-abc123
+#   Created batch: batch_xyz789
+#   Mapping file: ./output/.siftrank-batch.json
+#
+#   Check status:
+#     siftrank batch status batch_xyz789
+#
+#   Get results when complete:
+#     siftrank batch results ./output/.siftrank-batch.json
+
+# Step 2: Check status (repeat until "completed")
+siftrank batch status batch_xyz789
+
+# Output:
+#   Batch Status
+#   ============
+#   ID:        batch_xyz789
+#   Status:    completed
+#   Request Counts
+#     Total:     50
+#     Completed: 50
+#     Failed:    0
+
+# Step 3: Download and process results
+siftrank batch results ./output/.siftrank-batch.json > ranked_output.json
+```
+
+**Submit flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-f, --file` | (required) | Input file with documents (one per line) |
+| `-p, --prompt` | (required) | Ranking prompt (prefix with `@` to use a file) |
+| `-m, --model` | `gpt-4o-mini` | OpenAI model name |
+| `-b, --batch-size` | `10` | Documents per batch request |
+| `-o, --output-dir` | `.` | Directory for mapping file output |
+
+**How it works:**
+1. Documents are split into batches and formatted as JSONL for the OpenAI Batch API
+2. A mapping file (`.siftrank-batch.json`) is saved to correlate results back to input documents
+3. Results are scored by average position across batches (same scoring as real-time mode)
+
+**Note:** Batch mode only supports the OpenAI provider. Use the standard `siftrank` command for other providers.
+
 #### Trace File Monitoring
 
 Stream execution state to a file for analysis and debugging:
@@ -754,12 +898,12 @@ While building on the foundational algorithm from Raink, this implementation div
 
 - [ ] add python bindings?
 - [ ] factor LLM calls out into a separate package
-- [ ] run openai batch mode
-- [ ] add more examples, use cases
 - [ ] account for reasoning tokens separately
 
 <details><summary>Completed</summary>
 
+- [x] run openai batch mode
+- [x] add more examples, use cases
 - [x] allow specifying an input directory (where each file is distinct object)
 - [x] clarify when prompt included in token estimate
 - [x] report cost + token usage
